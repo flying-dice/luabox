@@ -54,7 +54,7 @@ mod query;
 mod value;
 mod vfs;
 
-pub use db::{Db, RootDatabase};
+pub use db::{Db, MAX_EXECUTION_LOG_ENTRIES, RootDatabase};
 pub use host::{Analysis, AnalysisHost, Change};
 pub use input::{Project, SourceFile};
 pub use query::{

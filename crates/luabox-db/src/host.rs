@@ -24,7 +24,8 @@ use crate::db::RootDatabase;
 use crate::input::{Project, SourceFile};
 use crate::query;
 use crate::value::{
-    Annotations, BindingTypes, LoweredHandle, ModuleExport, ParsedModule, TypeEnvHandle,
+    Annotations, BindingTypes, LoweredHandle, ModuleExport, ParsedModule, ProjectTypes,
+    TypeEnvHandle,
 };
 use crate::vfs::{FileId, Vfs};
 
@@ -71,6 +72,15 @@ pub struct AnalysisHost {
     inputs: HashMap<FileId, SourceFile>,
     project: Project,
     default_dialect: Dialect,
+    /// Monotonic change counter: bumped by **every** method that writes a
+    /// salsa input — [`Self::apply_change`] and [`Self::set_root`] — and
+    /// carried onto each [`Analysis`] snapshot. A consumer caching anything
+    /// derived from a snapshot (the LSP's merged ambient layer) keys the cache
+    /// on this — equal revisions mean no input changed, so the derivation is
+    /// current. The invariant is only worth as much as its enforcement: any
+    /// new mutator added here bumps it too, whether or not today's derivations
+    /// happen to read the input it writes.
+    revision: u64,
 }
 
 impl AnalysisHost {
@@ -86,6 +96,7 @@ impl AnalysisHost {
             inputs: HashMap::new(),
             project,
             default_dialect,
+            revision: 0,
         }
     }
 
@@ -97,7 +108,15 @@ impl AnalysisHost {
     /// resolve against `<root>/…` and `<root>/src/…` exactly as `luabox check`
     /// resolves them on disk. One root, one resolution ordering, editor and CI
     /// in lockstep.
+    ///
+    /// Bumps the change counter: the root is a salsa input like any other, so
+    /// a snapshot taken after a re-root must not compare equal to one taken
+    /// before it. Today's front-end calls this once at startup, before any
+    /// cache exists, and no cached derivation reads the root — but a cache key
+    /// that is right only by accident is a latent staleness bug, not an
+    /// invariant.
     pub fn set_root(&mut self, root: PathBuf) {
+        self.revision += 1;
         self.project.set_root(&mut self.db).to(root);
     }
 
@@ -108,8 +127,19 @@ impl AnalysisHost {
     }
 
     /// Apply one [`Change`], updating the VFS and the affected salsa inputs.
+    ///
+    /// Bumps [`Self::revision`] only when the change actually wrote a salsa
+    /// input (round 4 review R17). The unconditional bump this replaced fired
+    /// even when nothing moved — most visibly for `SetFileText`, which
+    /// `workspace/didChangeWatchedFiles` (`server.rs`) issues for every
+    /// non-deleted `.lua` file in a watch event regardless of whether its
+    /// text differs from what the host already has. Every revision-keyed
+    /// cache downstream (the LSP's `MergedAmbient`, `server.rs:1583`, keyed
+    /// on `Analysis::revision`) is invalidated on any bump, so a no-op write
+    /// was paying a full `clone_surface` + `merge_file_types` over every
+    /// project file for zero change.
     pub fn apply_change(&mut self, change: Change) {
-        match change {
+        let changed = match change {
             Change::SetFileText {
                 path,
                 dialect,
@@ -117,27 +147,37 @@ impl AnalysisHost {
             } => {
                 let id = self.vfs.intern(path, dialect);
                 self.vfs.set_disk_text(id, Some(text));
-                self.sync_file(id);
+                self.sync_file(id)
             }
             Change::SetOverlay { path, text } => {
                 let id = self.vfs.intern(path, self.default_dialect);
                 self.vfs.set_overlay(id, text);
-                self.sync_file(id);
+                self.sync_file(id)
             }
             Change::ClearOverlay { path } => {
                 if let Some(id) = self.vfs.file_id(&path) {
                     self.vfs.clear_overlay(id);
-                    self.sync_file(id);
+                    self.sync_file(id)
+                } else {
+                    false
                 }
             }
             Change::SetDialect { path, dialect } => {
                 let id = self.vfs.intern(path, dialect);
                 self.vfs.set_dialect(id, dialect);
-                self.sync_file(id);
+                self.sync_file(id)
             }
             Change::SetStrictness(strictness) => {
-                self.project.set_strictness(&mut self.db).to(strictness);
+                if self.project.strictness(&self.db) == strictness {
+                    false
+                } else {
+                    self.project.set_strictness(&mut self.db).to(strictness);
+                    true
+                }
             }
+        };
+        if changed {
+            self.revision += 1;
         }
     }
 
@@ -160,29 +200,58 @@ impl AnalysisHost {
             db: self.db.clone(),
             files,
             project: self.project,
+            revision: self.revision,
         }
     }
 
     /// Drain the query execution trace collected since the last call — the
-    /// list of queries that actually *ran* (cache misses). Test/tracing aid.
+    /// list of queries that actually *ran* (cache misses). Test aid: no
+    /// front-end calls this today, so a session that never drains it still
+    /// only ever retains the trace's capped tail (round 5 review N23)
+    /// rather than growing without bound.
+    ///
+    /// The drained list can be **lossy** (M46, round 6 review): past
+    /// [`crate::db::MAX_EXECUTION_LOG_ENTRIES`] entries since the last
+    /// drain, the oldest are evicted, so a query's *absence* from the
+    /// result can mean either "never ran" or "ran, but was evicted" — call
+    /// [`Self::execution_log_overflowed`] *first* to tell them apart; this
+    /// call resets that flag along with the entries it drains.
     #[must_use]
     pub fn take_execution_log(&self) -> Vec<String> {
         self.db.take_logs()
     }
 
+    /// Whether the trace [`Self::take_execution_log`] is about to drain has
+    /// evicted at least one entry since the last drain (M46, round 6
+    /// review) — call before draining, since draining clears this flag
+    /// along with the entries. A caller (or test) asserting a query is
+    /// *absent* from the drained log must check this first: `true` means
+    /// the absence proves nothing, because the missing entry may simply
+    /// have aged out.
+    #[must_use]
+    pub fn execution_log_overflowed(&self) -> bool {
+        self.db.log_overflowed()
+    }
+
     /// Reconcile the effective VFS text/dialect for `id` into salsa, creating
     /// the [`SourceFile`] input on first sight and updating fields only when
-    /// they actually change (so no spurious revisions).
-    fn sync_file(&mut self, id: FileId) {
+    /// they actually change (so no spurious revisions). Returns whether a
+    /// salsa input was actually written — the signal [`Self::apply_change`]
+    /// uses to decide whether [`Self::revision`] moves (round 4 review R17).
+    fn sync_file(&mut self, id: FileId) -> bool {
         let text = self.vfs.effective_text(id).unwrap_or("").to_owned();
         let dialect = self.vfs.dialect(id);
         if let Some(input) = self.inputs.get(&id).copied() {
+            let mut changed = false;
             if input.text(&self.db) != &text {
                 input.set_text(&mut self.db).to(text);
+                changed = true;
             }
             if input.dialect(&self.db) != dialect {
                 input.set_dialect(&mut self.db).to(dialect);
+                changed = true;
             }
+            changed
         } else {
             let path = self.vfs.path(id).to_path_buf();
             let input = SourceFile::new(&self.db, path, text, dialect);
@@ -190,6 +259,7 @@ impl AnalysisHost {
             let mut files = self.project.files(&self.db).clone();
             files.push(input);
             self.project.set_files(&mut self.db).to(files);
+            true
         }
     }
 }
@@ -200,9 +270,20 @@ pub struct Analysis {
     db: RootDatabase,
     files: HashMap<PathBuf, SourceFile>,
     project: Project,
+    /// The host's change counter at snapshot time — see
+    /// [`AnalysisHost::apply_change`]. Two snapshots with equal revisions saw
+    /// identical inputs, so anything derived from one is valid for the other.
+    revision: u64,
 }
 
 impl Analysis {
+    /// The host's change counter at snapshot time — a cache key for
+    /// derivations over this snapshot (equal revision ⇒ identical inputs).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// The typecheck diagnostics for `path`, or `None` if it is not a known
     /// file. Equal to [`luabox_types::check_file`] over the file's source.
     #[must_use]
@@ -287,8 +368,17 @@ impl Analysis {
     /// `function Class:method` member attachments — resolves from every
     /// other file). Merge them beneath an ambient layer with
     /// [`luabox_types::Ambient::with_project_types`].
+    ///
+    /// Returns the `Arc`-backed [`ProjectTypes`] wrapper itself rather than
+    /// a fresh `Vec` (round 4 review finding 2): the memoized query already
+    /// holds every file's class/enum/alias maps behind an `Arc`, so cloning
+    /// it here is a refcount bump, not a deep copy of each file's maps — the
+    /// clone this used to pay on every call, including the `merged_ambient`
+    /// rebuild path this same PR made cheap everywhere else. `ProjectTypes`
+    /// derefs to `&[FileTypes]`, so every existing call site (`&[FileTypes]`
+    /// parameters, `.iter()`, `with_project_types`) needs no change.
     #[must_use]
-    pub fn project_types(&self) -> Vec<luabox_types::FileTypes> {
+    pub fn project_types(&self) -> ProjectTypes {
         query::project_types_checked(&self.db, self.project)
     }
 

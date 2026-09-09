@@ -4,6 +4,12 @@
 //! assignments to that local are checked against it too (`LB0300`).
 //! (c) every `return` expression must fit the function's `---@return` list,
 //! in count and in type (`LB0304`).
+//!
+//! Also home to the local-function-literal binding pin (#58): an
+//! unannotated `local f = function() end` binds as an (opaque) function,
+//! not as `unknown` — the difference is invisible to rejecting probes
+//! (strict mode rejects both against a scalar) and separable only by an
+//! accepting one.
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{Dialect, parse};
@@ -78,6 +84,43 @@ end
 }
 
 #[test]
+fn return_type_mismatch_against_unknown_names_no_remedy() {
+    // Round 3 review F72 had `check_slot` append a blanket "(add `---@type
+    // <expected>` to check it)" remedy whenever the found type was
+    // `unknown` — for a call-argument mismatch that is at least sometimes
+    // actionable (a `require` binding can carry `---@type`), but a `return`
+    // has no binding at all, and `---@type` is not even the applicable tag
+    // for one (`---@return` is). Round 4 review R12 withdrew the remedy
+    // rather than special-case it, since a suggestion naming a tag and a
+    // site that do not apply here misdirects. `require` of a module this
+    // fixture never declares a type for resolves as bare `unknown` — the
+    // exact case F72's remedy targeted — and strict mode still rejects it
+    // against the declared `number` return.
+    let src = "\
+---@return number
+local function f()
+  local mod = require(\"bogus\")
+  return mod
+end
+";
+    let diags = check(src, Strictness::Strict);
+    assert_eq!(
+        diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+        vec!["LB0304"]
+    );
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "{}",
+        diags[0].message
+    );
+    assert!(
+        !diags[0].message.contains("---@type"),
+        "a `return` has no binding and `---@type` is not its tag: {}",
+        diags[0].message
+    );
+}
+
+#[test]
 fn return_count_mismatch() {
     let src = "\
 ---@return number, string
@@ -128,4 +171,50 @@ local function f(s)
 end
 ";
     assert_eq!(strict_codes(src), vec!["LB0304"]);
+}
+
+#[test]
+fn an_unannotated_function_literal_local_binds_as_a_function() {
+    // Behavioural pin (written during the #58 audit): an opaque function
+    // satisfies a `fun()` parameter, while `unknown` would be rejected by
+    // strict mode. Measured: this answer is served by INFERENCE — the P0
+    // checker's own function-literal arm is shadowed (its mutant survives
+    // this test), which is evidence for the shadowed-fallback finding, not
+    // a kill.
+    let src = "\
+---@param g fun()
+local function want_fun(g) end
+
+local f = function() end
+want_fun(f)
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn generic_arity_message_pluralizes_by_count() {
+    // #58 mutation audit: the singular/plural pick in the LB0313 message
+    // was the one unpinned observable of the arity report. The counts and
+    // the code are asserted elsewhere; this pins the words.
+    let src = "\
+---@class Boxed<T>
+---@field v T
+
+---@type Boxed<string, number>
+local b
+print(b)
+";
+    let ds = check(src, Strictness::Strict);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert_eq!(ds[0].code.to_string(), "LB0313");
+    assert!(
+        ds[0].message.contains("takes 1 type argument,"),
+        "singular for one parameter: {}",
+        ds[0].message
+    );
+    assert!(
+        ds[0].message.contains("2 were supplied"),
+        "{}",
+        ds[0].message
+    );
 }

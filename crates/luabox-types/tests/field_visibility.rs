@@ -125,6 +125,33 @@ end
 }
 
 #[test]
+fn protected_blocked_in_an_unrelated_classes_method() {
+    // The shape the free-function case above cannot cover (#58 mutation
+    // audit): reading a protected member from inside SOME class's method is
+    // the one path that consults the subclass walk (`is_subclass`) — a
+    // free function short-circuits on having no enclosing class at all. An
+    // unrelated class's method must be blocked exactly like the free
+    // function, or the walk could answer "everything is a subclass" and no
+    // fixture would notice.
+    let src = "\
+---@class Base
+---@field protected token? string
+local Base = {}
+Base.__index = Base
+
+---@class Stranger
+local Stranger = {}
+Stranger.__index = Stranger
+
+---@param b Base
+function Stranger:peek(b)
+  return b.token
+end
+";
+    assert_eq!(strict_codes(src), vec!["LB0312"]);
+}
+
+#[test]
 fn private_not_visible_in_subclass() {
     // luals: private is same-class-only — a subclass method cannot read a
     // private parent member (protected would).

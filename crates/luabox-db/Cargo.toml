@@ -2,6 +2,7 @@
 name = "luabox-db"
 description = "luabox: incremental query database shared by check/lint/lsp/fmt (Semantics context)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,11 +15,6 @@ luabox-hir.workspace = true
 luabox-types.workspace = true
 luabox-bundle.workspace = true
 salsa.workspace = true
-
-[dev-dependencies]
-luabox-diag.workspace = true
-luabox-syntax.workspace = true
-luabox-types.workspace = true
 
 [lints]
 workspace = true

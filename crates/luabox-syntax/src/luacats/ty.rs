@@ -19,6 +19,62 @@ pub struct TypeExpr {
     pub span: Span,
 }
 
+impl TypeExpr {
+    /// The first [`TypeExprKind::Error`] node in this expression, itself
+    /// included — `None` for an expression the parser read cleanly.
+    ///
+    /// `Error` is the parser's recovery node, and it does **not** only appear
+    /// at the root: postfix and grouping operators are applied to whatever
+    /// they follow, so `?` after an unreadable token yields
+    /// `Optional(Error)`, `[]` yields `Array(Error)`, and a union or a
+    /// parenthesis buries it further still. A consumer that matched on the
+    /// root alone (`LB0321` did, for one round) sees a clean-looking
+    /// `Optional` and reports nothing — the exact silence the diagnostic
+    /// exists to remove.
+    ///
+    /// It answers "is there an unreadable token anywhere in here", nothing
+    /// narrower: a [`TypeExprKind::Named`]'s generic arguments count, so
+    /// `Base<?>` carries an error even though `Base` itself read fine. A
+    /// caller asking the narrower question — whether the *expression* is
+    /// usable as the thing it is written in place of — has to say so itself;
+    /// `luabox-types`' `unnamed_parent_entry` is one, and stops at a name.
+    ///
+    /// The returned node is the innermost one on the path, so a diagnostic
+    /// anchors on the token the parser actually choked on rather than on the
+    /// wrapper around it. The match is exhaustive by design: a new
+    /// `TypeExprKind` carrying a nested [`TypeExpr`] will not compile until it
+    /// is handled here.
+    #[must_use]
+    pub fn first_error(&self) -> Option<&TypeExpr> {
+        fn first<'a>(exprs: impl IntoIterator<Item = &'a TypeExpr>) -> Option<&'a TypeExpr> {
+            exprs.into_iter().find_map(TypeExpr::first_error)
+        }
+        match &self.kind {
+            TypeExprKind::Error => Some(self),
+            TypeExprKind::Named { args, .. } => first(args),
+            TypeExprKind::Optional(inner)
+            | TypeExprKind::Array(inner)
+            | TypeExprKind::Paren(inner) => inner.first_error(),
+            TypeExprKind::Union(items) | TypeExprKind::Tuple(items) => first(items),
+            TypeExprKind::Table(fields) => fields.iter().find_map(|field| match field {
+                TableField::Named { ty, .. } => ty.first_error(),
+                TableField::Indexer { key, value } => {
+                    key.first_error().or_else(|| value.first_error())
+                }
+            }),
+            TypeExprKind::Fun { params, returns } => params
+                .iter()
+                .filter_map(|param| param.ty.as_ref())
+                .find_map(TypeExpr::first_error)
+                .or_else(|| first(returns.iter().map(|ret| &ret.ty))),
+            TypeExprKind::StringLit(_)
+            | TypeExprKind::NumberLit(_)
+            | TypeExprKind::BoolLit(_)
+            | TypeExprKind::Backtick(_) => None,
+        }
+    }
+}
+
 /// The shape of a [`TypeExpr`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeExprKind {

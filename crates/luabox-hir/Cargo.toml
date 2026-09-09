@@ -2,6 +2,7 @@
 name = "luabox-hir"
 description = "luabox: desugared IR and name resolution (Semantics context)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

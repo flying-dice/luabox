@@ -18,7 +18,12 @@ use std::fmt;
 /// expression (untyped = `unknown`, not `any`, per SPEC.md §3): in warn
 /// mode it is assignable both ways, in strict mode `unknown -> T` is an
 /// error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Derives `Hash` (round 4 review finding 5) so the diamond walk's memo
+/// (`(String, Vec<Ty>)`) can live in a `HashSet` — every reachable field
+/// here is itself `Hash` (no `f64`/`HashMap` anywhere in the tree), so this
+/// is a clean derive, not a wrapper or a manual impl.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// No information — the type of unannotated code.
     Unknown,
@@ -68,7 +73,7 @@ pub struct OperatorSig {
 }
 
 /// One named field of a [`TableTy`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldTy {
     /// The field's value type.
     pub ty: Ty,
@@ -79,7 +84,7 @@ pub struct FieldTy {
 /// The structural shape of a table: named fields, typed indexers, and an
 /// array part. `table<K, V>` becomes one indexer; `T[]` becomes the array
 /// part; the bare `table` annotation becomes `{ [any]: any }`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct TableTy {
     /// Named fields, ordered for deterministic diagnostics.
     pub fields: BTreeMap<String, FieldTy>,
@@ -95,7 +100,7 @@ pub struct TableTy {
 /// parameter and return types; call-site inference binds it and substitutes
 /// (see [`crate::generics`]). `constraint`, when present, is checked against
 /// the inferred binding (luals's bounded generics).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypeParam {
     /// The type-variable name (`T`).
     pub name: String,
@@ -104,7 +109,7 @@ pub struct TypeParam {
 }
 
 /// One parameter of a [`FunctionTy`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParamTy {
     /// The declared parameter name (diagnostics only).
     pub name: String,
@@ -116,7 +121,7 @@ pub struct ParamTy {
 
 /// A function signature from `---@param` / `---@return` annotations (or a
 /// `fun(...)` type expression).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each flag models a distinct, independent LuaCATS annotation \

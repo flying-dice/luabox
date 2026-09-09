@@ -60,6 +60,7 @@
 
 mod assign;
 mod check;
+mod class_graph;
 mod codes;
 mod defs;
 mod directive;
@@ -72,10 +73,32 @@ pub mod ty;
 mod version;
 
 pub use assign::{Exactness, assignable};
+// The declaration-driven `LB0318` seam — the algorithm, the report-site rule
+// and the message, owned here because BOTH `luabox check` and the LSP run it
+// (round 12 review R12-1: it shipped inside `luabox-cli`, so the editor was
+// silent on the exact fixture the feature targets).
+// `class_cycles` is deliberately NOT re-exported (round 13 review, clean-code
+// note): a workspace grep found no caller outside the module — both surfaces
+// consume `ClassGraph::cycle_sites` — and a bare parent-map entry point is an
+// invitation to a third harvest with its own parent rule, which is the drift
+// R13-C just closed.
+pub use class_graph::{
+    CYCLIC_CLASS_LABEL, ClassCycleSite, ClassDeclaration, ClassGraph, cyclic_class_message,
+};
+pub use codes::{CLASS_COST_LIMIT, CLASS_DEPTH_LIMIT, CYCLIC_CLASS};
 pub use defs::{
     Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,
 };
-pub use env::{FileTypes, TypeEnv};
+// `parse_directive_body` is deliberately NOT re-exported: it was public for
+// a caller that no longer exists (round 8 review F22 — a workspace grep found
+// exactly one caller, `DirectiveScan::scan`, in its own module). Public
+// surface is semver-bound, so an unused `pub fn` is a promise nobody asked
+// for; `DirectiveScan` is the interface, the parser behind it is not.
+pub use directive::{
+    DirectiveScan, RULE_CIRCLE_DOC_CLASS, RULE_CLASS_ANCESTRY_TOO_COSTLY,
+    RULE_CLASS_ANCESTRY_TOO_DEEP,
+};
+pub use env::{FieldDeclSite, FieldOrigin, FileTypes, MAX_ANCESTRY_DEPTH, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use rocks::{RockFile, RockModule, RockSurfaces};
 pub use version::VersionReq;
@@ -230,6 +253,20 @@ impl FileArtifacts {
     pub fn requires(&self) -> Vec<String> {
         requires_of(&self.lowered)
     }
+
+    /// This file's harvested LuaCATS annotation blocks — [`Self::new`]'s own
+    /// `luacats::harvest` call, exposed so a caller that already built
+    /// `FileArtifacts` for other reasons (module surface, checking) can
+    /// reuse the same harvest for its own annotation-only walk instead of
+    /// harvesting the file a second time (round 6 review M19:
+    /// `luabox-cli`'s `check_cmd::class_ancestry_precheck` used to call
+    /// `luacats::harvest` again, serially, for every project file, even
+    /// though this is the exact harvest `FileArtifacts::new` already built
+    /// for the same file).
+    #[must_use]
+    pub fn items(&self) -> &[luacats::AnnotatedItem] {
+        &self.items
+    }
 }
 
 /// Compute one file's [`ModuleSurface`]: the reified `require`-export type
@@ -266,17 +303,97 @@ pub fn module_surface_with_artifacts(
     ambient: Option<&Ambient>,
     artifacts: &FileArtifacts,
 ) -> ModuleSurface {
+    let env = build_file_env(parse, artifacts, ambient);
+    module_surface_from_env(&env, file, artifacts)
+}
+
+/// The environment [`module_surface_from_env`]/[`check_file_from_env`] share
+/// — split out for a caller needing both against the *same* `ambient` that
+/// has a place to hold `env` across both calls.
+///
+/// [`module_surface_with_artifacts`] and [`check_file_with_artifacts`] each
+/// build their own `env` this way and discard it after one use, which is
+/// **deliberate**, not merely "the simple option" (round 4 review finding 6
+/// reverted round 4 review R14's attempt at sharing one build across both
+/// halves in the CLI batch path, `check_cmd.rs`'s `run_passes` — see that
+/// function's doc comment for the measurement): the check half needs every
+/// file's export already collected into the project-wide `require` registry
+/// before any file can be checked, so a caller cannot fold this and
+/// [`check_file_from_env`] into one per-file call — it has to build the
+/// export half for every file, THEN check every file. R14 kept each file's
+/// built `TypeEnv` alive in a `Vec` across that gap instead of building a
+/// second one; that traded CPU time for peak memory that scales with
+/// (file count × ambient size) instead of (rayon parallelism × ambient
+/// size) — an O(N²)-ish regression measured at ~29x peak RSS on a 500-file
+/// synthetic project for a ~1.76x CPU win, the wrong side of that trade at
+/// realistic project sizes.
+///
+/// **Do not thread one `env` from this function across a `rayon` pass over
+/// a project's files** — that is the CLI batch path
+/// (`check_cmd.rs`'s `run_passes`) above all; it is exactly the shape R14
+/// had and reverted. Re-measured independently for the gate below (N-file
+/// project, two `---@class` declarations per file, a linear `require`
+/// chain, release build, peak RSS via `scripts/peak-rss.py`, three runs
+/// each):
+///
+///   N      one build/file (this function, per call)   one retained `Vec<TypeEnv>` (R14)
+///   100    11 MiB                                       51 MiB   (4.6x)
+///   200    15 MiB                                      145 MiB   (9.3x)
+///   300    20 MiB                                      290 MiB  (14.5x)
+///   500    29 MiB                                      734 MiB  (25.3x)
+///
+/// `scripts/perf-gate.sh`'s "RETAINED-TYPEENV REGRESSION GATE" leg
+/// reproduces the N=500 row on every CI run (budget 100 MiB — the
+/// transient column has ~3x headroom under it, the retained column misses
+/// it by ~7x) specifically so this regression fails loudly instead of
+/// shipping again. `build_file_env` still exists for a caller with a good
+/// reason to hold `env` across two calls of its own on ONE file — just
+/// budget the same tradeoff before reaching for it across many.
+// Round 6 review M47: this used to be `pub fn` with zero callers outside
+// this file — round 5 raised the same finding (N51) and it was answered
+// with a longer doc comment instead of a visibility change. Grepped the
+// whole workspace immediately before this edit: every reference to
+// `build_file_env` outside this file is a doc comment or intra-doc link
+// (`check_cmd.rs:366`, and the `[`build_file_env`]` links in this file's own
+// docs below), never a call. Private — the doc comment above still stands as
+// the record of why the function exists and what NOT to do with it.
+#[must_use]
+fn build_file_env(
+    parse: &lua::Parse,
+    artifacts: &FileArtifacts,
+    ambient: Option<&Ambient>,
+) -> TypeEnv {
+    TypeEnv::build_from_items(parse, &artifacts.items, ambient)
+}
+
+/// [`module_surface_with_artifacts`] over an already-built [`TypeEnv`]
+/// ([`build_file_env`]), for a caller that also runs [`check_file_from_env`]
+/// against the identical `env` and must not pay
+/// `TypeEnv::build_from_items`'s ambient-cloning cost twice — see
+/// [`build_file_env`]'s doc comment for why the CLI batch path builds its
+/// own `env` per call instead (round 4 review finding 6).
+///
+/// The CLI batch path (`check_cmd.rs`'s `run_passes`) must NOT call this
+/// with an `env` held alive across its `rayon` pass over every project
+/// file — that reintroduces R14's retained `Vec<TypeEnv>`, measured at up
+/// to ~25x peak RSS over the transient one-build-per-call shape at N=500
+/// files (see [`build_file_env`]'s doc comment for the full table), and is
+/// now caught by `scripts/perf-gate.sh`'s "RETAINED-TYPEENV REGRESSION
+/// GATE" leg (500-file corpus, budget 100 MiB).
+// M47: same as `build_file_env` above — zero external callers, verified by
+// the same workspace grep.
+#[must_use]
+fn module_surface_from_env(env: &TypeEnv, file: &str, artifacts: &FileArtifacts) -> ModuleSurface {
     let items = &artifacts.items;
-    let env = TypeEnv::build_from_items(parse, items, ambient);
     let outcome = infer::run(
         &artifacts.lowered,
-        &env,
+        env,
         file,
         Exactness::Strict,
         InferMode::Check,
         None,
     );
-    let types = FileTypes::collect(items, &env, &outcome.carrier_class_final);
+    let types = FileTypes::collect(items, env, &outcome.carrier_class_final, file);
     ModuleSurface {
         export: outcome.module_export,
         types,
@@ -385,6 +502,229 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
     requires: &HashMap<String, Ty, S>,
     artifacts: &FileArtifacts,
 ) -> Vec<Diagnostic> {
+    check_file_with_artifacts_and_sources(
+        parse, file, strictness, edition, ambient, requires, artifacts, None,
+    )
+}
+
+/// A project file name → that file's source text lookup, called on demand by
+/// [`check_file_with_artifacts_and_sources`]'s cross-file suppression scan.
+/// Named so the signatures that carry it read as "a source resolver", not a
+/// `dyn Fn` clippy flags as too complex to leave inline.
+pub type SourceResolver<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// [`check_file_with_artifacts`] plus a cross-file source resolver — the fix
+/// for the `---@diagnostic disable` escape hatch not working cross-file
+/// (production readiness review G1).
+///
+/// A `---@class` cycle/depth-limit diagnostic (`LB0317`/`LB0318`) can carry a
+/// primary label whose span belongs to a **different** project file than
+/// `file` — the `cross_file_class_decl_span` attribution tier in
+/// [`check::report_depth_limit_hits`]/[`check::report_cyclic_class_hits`]
+/// fires whenever the offending class is declared in a file other than the
+/// one whose check pass happened to trip the resolver's guard. The
+/// suppression scan below must honor *that* file's own
+/// `---@diagnostic disable` directives, at *that* file's own line numbers —
+/// never this file's, which is what the plain [`check_file_with_artifacts`]
+/// used to do unconditionally (reusing `file`'s `LineIndex` against another
+/// file's byte offsets — silently wrong line numbers feeding suppression, so
+/// a correctly-scoped `disable-line` could hit or miss arbitrarily).
+///
+/// `other_sources` resolves a project file name (a diagnostic's foreign
+/// `Span::file`) to that file's source text, on demand — called at most once
+/// per distinct foreign file a suppressible diagnostic actually names, never
+/// for a file with nothing to suppress. `None` (what
+/// [`check_file_with_artifacts`] passes) means "no cross-file lookup is
+/// available": a cross-file diagnostic is then left **unsuppressed** rather
+/// than checked against the wrong file — the safe default, and a strict
+/// correctness improvement over the old always-wrong-when-foreign behaviour,
+/// not merely "no worse". Only a caller that holds every project file's
+/// source in reach — `luabox-cli`'s `check_cmd::check_one` — can supply a
+/// resolver and get full cross-file suppression.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bottom rung of the check_file entry-point ladder; every \
+              rung above it has external consumers (measured, round 8 review \
+              F22 — see CheckFileInputs), so none can be collapsed and this \
+              signature is load-bearing public API. The internal seam it \
+              feeds does take a params struct: further inputs go on \
+              CheckFileInputs, not onto a sixth `_and_` entry point"
+)]
+pub fn check_file_with_artifacts_and_sources<S: std::hash::BuildHasher>(
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    edition: lua::Dialect,
+    ambient: Option<&Ambient>,
+    requires: &HashMap<String, Ty, S>,
+    artifacts: &FileArtifacts,
+    other_sources: Option<SourceResolver<'_>>,
+) -> Vec<Diagnostic> {
+    let env = build_file_env(parse, artifacts, ambient);
+    check_file_from_env(
+        &env,
+        &CheckFileInputs {
+            parse,
+            file,
+            strictness,
+            edition,
+            ambient,
+            requires,
+            artifacts,
+            other_sources,
+        },
+    )
+}
+
+/// Everything one file's check needs beyond its [`TypeEnv`] — the arguments
+/// the public `check_file*` ladder accumulates, carried as one value across
+/// the crate's own internal seam.
+///
+/// **Why a struct here and not on the public entry points** (round 8 review
+/// F22). The ladder is `check_file` → `_with_ambient` → `_with_requires` →
+/// `_with_artifacts` → `_with_artifacts_and_sources`, each rung adding one
+/// argument, and the finding was that a sixth cross-file input would force a
+/// sixth `_and_` name. A workspace grep at that round measured which rungs
+/// could simply be demoted instead: **none** — `check_file` is called from
+/// `luabox-db` (`query.rs`, `value.rs`, `host.rs`) and 20 integration test
+/// files, `_with_ambient` from `defs.rs`/`rocks.rs` and 14 test files,
+/// `_with_requires` from `luabox-db` and `luabox-lsp` (`diagnostics.rs`,
+/// `merged_ambient.rs`, `requires.rs`), `_with_artifacts` and
+/// `_with_artifacts_and_sources` from `luabox-cli`'s `check_cmd.rs`. Every
+/// rung is load-bearing published API; collapsing one to `pub(crate)` would
+/// break another crate, not tidy an unused name.
+///
+/// So the growth point moves inward instead: the public terminal signature is
+/// frozen at eight arguments, and this struct is what the crate threads
+/// onward. A future cross-file input becomes a field here, reachable from the
+/// existing entry point, rather than a sixth public name that can never be
+/// removed.
+struct CheckFileInputs<'a, S: std::hash::BuildHasher> {
+    parse: &'a lua::Parse,
+    file: &'a str,
+    strictness: Strictness,
+    edition: lua::Dialect,
+    ambient: Option<&'a Ambient>,
+    requires: &'a HashMap<String, Ty, S>,
+    artifacts: &'a FileArtifacts,
+    other_sources: Option<SourceResolver<'a>>,
+}
+
+/// Drop the diagnostics a `---@diagnostic disable*: <rule>` directive
+/// silences — luals' own suppression syntax, honoured for every checker
+/// diagnostic that carries a luals rule name (`undefined-field` → LB0306,
+/// `deprecated` → LB0308, `discard-returns` → LB0309, `duplicate-doc-field`
+/// → LB0311, `circle-doc-class` → LB0318, ...). One scan serves them all;
+/// see `directive.rs` for why it does not reuse the linter's engine.
+///
+/// `other_sources` is the cross-file resolver described on
+/// [`check_file_with_artifacts_and_sources`]; `None` — what the language
+/// server passes — leaves a cross-file-attributed diagnostic standing rather
+/// than checking it against the wrong file's line numbers.
+fn drain_suppressed_by_directives(
+    diags: &mut Vec<Diagnostic>,
+    parse: &lua::Parse,
+    file: &str,
+    other_sources: Option<SourceResolver<'_>>,
+) {
+    if !diags
+        .iter()
+        .any(|d| directive::rule_for_code(d.code).is_some())
+    {
+        return;
+    }
+    let source = parse.syntax().text().to_string();
+    let sup = directive::DirectiveScan::scan(&source);
+    // Worth building the `LineIndex` + running the per-diagnostic scan
+    // when either this file's own directives might suppress something,
+    // OR a cross-file resolver is in reach: a diagnostic can carry a
+    // primary label belonging to a file OTHER than `file` (G1 — see
+    // `check_file_with_artifacts_and_sources`'s doc comment), which this
+    // file's own (empty) `sup` would never see, but a foreign file's
+    // directives still might suppress.
+    if !sup.any() && other_sources.is_none() {
+        return;
+    }
+    // One table for the file: a newline count from byte 0 per
+    // diagnostic is O(diagnostics x file size).
+    let lines = LineIndex::new(&source);
+    // Lazily built per foreign file a diagnostic's primary label
+    // actually names — most files never trip this at all, and a
+    // project with many files must not pay for scanning every one
+    // just because one of them has a suppressible diagnostic.
+    let mut foreign: HashMap<String, (directive::DirectiveScan, LineIndex)> = HashMap::new();
+    diags.retain(|d| {
+        let Some(rule) = directive::rule_for_code(d.code) else {
+            return true;
+        };
+        let Some(label) = d.primary_label() else {
+            return true;
+        };
+        if label.span.file == file {
+            let line = lines.line_of(label.span.range.start);
+            return !sup.suppresses(rule, line);
+        }
+        // A cross-file primary label (`cross_file_class_decl_span`):
+        // suppression-check it against ITS OWN declaring file's
+        // directives and line index, never this file's — reusing
+        // `lines` (built from `file`'s source) against another
+        // file's byte offsets is exactly the bug this fixes.
+        let Some(resolve) = other_sources else {
+            // No resolver: cannot determine correctly. Never
+            // suppress rather than guess with the wrong file's line
+            // index — the safe default (see the doc comment on
+            // `check_file_with_artifacts_and_sources`).
+            return true;
+        };
+        let (foreign_sup, foreign_lines) =
+            foreign.entry(label.span.file.clone()).or_insert_with(|| {
+                let text = resolve(&label.span.file).unwrap_or_default();
+                let scan = directive::DirectiveScan::scan(&text);
+                let idx = LineIndex::new(&text);
+                (scan, idx)
+            });
+        let line = foreign_lines.line_of(label.span.range.start);
+        !foreign_sup.suppresses(rule, line)
+    });
+}
+
+/// [`check_file_with_artifacts`] over an already-built [`TypeEnv`]
+/// ([`build_file_env`]) — see [`build_file_env`]'s doc comment for why the
+/// CLI batch path does not currently hold one `env` across a call to this
+/// and a call to [`module_surface_from_env`] (round 4 review finding 6).
+///
+/// Same rule as [`module_surface_from_env`]: the CLI batch path
+/// (`check_cmd.rs`'s `run_passes`/`check_one`) must build and drop its own
+/// `env` per file, never one held across its `rayon` pass over the whole
+/// project — R14 did that and cost up to ~25x peak RSS over the transient
+/// shape at N=500 files (measured table in [`build_file_env`]'s doc
+/// comment), now a CI-blocking leg in `scripts/perf-gate.sh`
+/// ("RETAINED-TYPEENV REGRESSION GATE", 500-file corpus, budget 100 MiB).
+// M47: same as `build_file_env` above — zero external callers, verified by
+// the same workspace grep.
+//
+// Two arguments, not nine: the nine used to be spelled out here under a
+// `#[allow(clippy::too_many_arguments)]` that pointed at the public rung's
+// identical allow, so the lint was suppressed twice for one problem. The
+// public rung's signature is fixed by its external callers;
+// this one's was not, and now carries [`CheckFileInputs`] (round 8 review
+// F22). The allow is gone from this seam entirely.
+#[must_use]
+fn check_file_from_env<S: std::hash::BuildHasher>(
+    env: &TypeEnv,
+    inputs: &CheckFileInputs<'_, S>,
+) -> Vec<Diagnostic> {
+    let &CheckFileInputs {
+        parse,
+        file,
+        strictness,
+        edition,
+        ambient,
+        requires,
+        artifacts,
+        other_sources,
+    } = inputs;
     let items = &artifacts.items;
     // A `---@meta` definition package: its `---@class` declarations are
     // contracts, not carriers, so no `: Interface` conformance runs inside it
@@ -398,7 +738,6 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    let env = TypeEnv::build_from_items(parse, items, ambient);
     // A resolved `require`-export registry (#85) reaches inference through
     // the display-mode `externals` channel, but with call-site parameter
     // seeding OFF (`fn_param_seeds` empty, `seed_params` false below): only
@@ -426,7 +765,7 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
         // (LB0306) at the same strictness-mapped severity.
         let inference = infer::run(
             &artifacts.lowered,
-            &env,
+            env,
             file,
             Exactness::from_strict(strictness == Strictness::Strict),
             InferMode::Check,
@@ -434,7 +773,7 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
         );
         diags.extend(check::run(
             parse,
-            &env,
+            env,
             file,
             strictness == Strictness::Strict,
             is_meta,
@@ -445,35 +784,25 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
         // Duplicate `---@field` on one class (luals `duplicate-doc-field`,
         // LB0311) — a per-file doc-consistency finding, so it is emitted here
         // alongside the type diagnostics and suppressed under `None` like them.
-        diags.extend(check::duplicate_doc_fields(items, file));
+        // `ambient` matters to the key identity: a defs-declared alias in an
+        // indexer key must collide with its expansion, and only the ambient
+        // layer can resolve it (`duplicate_doc_fields_with_ambient`'s doc).
+        diags.extend(check::duplicate_doc_fields_with_ambient(
+            items, file, ambient,
+        ));
+        // A `---@class` header that cannot become a class (LB0320/LB0321,
+        // #69) — the same kind of per-file doc-consistency finding as the
+        // duplicate-field pass above, and emitted here for the same reason:
+        // it reads the harvested doc blocks, not the `TypeEnv`, because a
+        // header with no usable name never reaches the env at all.
+        diags.extend(check::malformed_class_headers(
+            items,
+            file,
+            strictness == Strictness::Strict,
+        ));
     }
 
-    // Honor luals' `---@diagnostic disable*: <rule>` for the checker
-    // diagnostics that carry a luals rule name (`undefined-field` → LB0306,
-    // `deprecated` → LB0308, `discard-returns` → LB0309, `duplicate-doc-field`
-    // → LB0311). One scan serves them all; see `directive.rs` for why it does
-    // not reuse the linter's engine.
-    if diags
-        .iter()
-        .any(|d| directive::rule_for_code(d.code).is_some())
-    {
-        let source = parse.syntax().text().to_string();
-        let sup = directive::DirectiveScan::scan(&source);
-        if sup.any() {
-            // One table for the file: a newline count from byte 0 per
-            // diagnostic is O(diagnostics x file size).
-            let lines = LineIndex::new(&source);
-            diags.retain(|d| {
-                let Some(rule) = directive::rule_for_code(d.code) else {
-                    return true;
-                };
-                let line = d
-                    .primary_label()
-                    .map_or(0, |l| lines.line_of(l.span.range.start));
-                !sup.suppresses(rule, line)
-            });
-        }
-    }
+    drain_suppressed_by_directives(&mut diags, parse, file, other_sources);
 
     // Collapse cascades: an undefined-field read (LB0306) makes the
     // expression `unknown`, and that `unknown` then mismatches wherever the

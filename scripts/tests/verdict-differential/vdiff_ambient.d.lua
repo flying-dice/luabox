@@ -1,0 +1,3 @@
+---@meta
+---@class VAmbient
+---@field x number

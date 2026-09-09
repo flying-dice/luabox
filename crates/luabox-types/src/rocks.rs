@@ -486,6 +486,85 @@ return M
     }
 
     #[test]
+    fn a_rock_carrier_export_resolves_through_a_project_class_that_shadows_it() {
+        // F45 residual (round 3 review): before #56 a module's export was
+        // always structural, so a rock's export never needed environment
+        // resolution — shadowing only ever affected direct annotation
+        // lookups (the sibling test above). Now a `---@class` carrier
+        // crosses `require` as `Ty::Named`, so a rock module that returns
+        // ITSELF as its class carrier has that identity resolved through the
+        // *consumer's* ambient at the use site, not baked into the export
+        // value. `with_rock_types` stays first-wins beneath
+        // `with_project_types` — #30's escape hatch: a project declaration
+        // of a name a rock also uses REPLACES the rock's, it does not merge
+        // with it — so requiring the rock module now resolves through the
+        // *project's* shape, not the rock's own. Correct per the escape
+        // hatch, but nothing pinned it once the export stopped being
+        // structural.
+        let rock_src = "\
+---@class mylib.Point
+---@field x number
+local M = {}
+return M
+";
+        let surfaces = harvest_of(&[rock("mylib", rock_src)]);
+        let project = crate::module_surface(
+            &lua::parse(
+                "---@class mylib.Point\n---@field y number\n",
+                Dialect::Lua54,
+            ),
+            "defs.lua",
+            None,
+        );
+        let ambient = stdlib_defs(Dialect::Lua54)
+            .with_project_types([&project.types])
+            .with_rock_types(surfaces.types());
+        let requires: BTreeMap<String, Ty> = surfaces.by_module().clone();
+        let requires: std::collections::HashMap<String, Ty> = requires.into_iter().collect();
+
+        // The project's shadowing declaration (`y`) is what the require
+        // resolves through — not the rock's own `x`.
+        let shadowed = lua::parse(
+            "local p = require(\"mylib\")\n---@type number\nlocal n = p.y\n",
+            Dialect::Lua54,
+        );
+        let diags = crate::check_file_with_requires(
+            &shadowed,
+            "src/main.lua",
+            crate::Strictness::Strict,
+            Dialect::Lua54,
+            Some(&ambient),
+            &requires,
+        );
+        assert!(
+            diags.is_empty(),
+            "the project's shadowing declaration must be what the require \
+             resolves through: {diags:?}"
+        );
+
+        // …and the rock's own field does not leak through: the project
+        // declaration replaced it rather than merging with it.
+        let rock_field = lua::parse(
+            "local p = require(\"mylib\")\nlocal _ = p.x\n",
+            Dialect::Lua54,
+        );
+        let diags = crate::check_file_with_requires(
+            &rock_field,
+            "src/main.lua",
+            crate::Strictness::Strict,
+            Dialect::Lua54,
+            Some(&ambient),
+            &requires,
+        );
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0306".to_string()],
+            "the rock's own field must not leak through once a project \
+             declaration claims the name: {diags:?}"
+        );
+    }
+
+    #[test]
     fn with_rock_types_fills_only_unclaimed_names() {
         let surfaces = harvest_of(&[
             rock("a", "---@class shared.Thing\n---@field from_a number\n"),

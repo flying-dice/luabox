@@ -1,0 +1,17 @@
+# Hourly eviction for the runner's host-bound cache/builds directories: 24h
+# rule, `fuzz-corpus-*` exempt from it, 200 GiB cap on the cache as the
+# backstop. The script header holds the whole contract.
+#
+# stdout and stderr go to /dev/null deliberately — the channel is syslog. The
+# sweep logs every deletion and every refusal through `logger` (refusals at
+# `user.err`), which is what survives dcron; duplicating it here would only
+# fill root's mail spool with the same lines.
+#
+# Running hourly is safe against overrun: the sweep takes `flock -n` on
+# /var/run/runner-cache-sweep.lock and exits 0 with `skipped: another sweep
+# holds ...` if the previous run is still walking the trees, so two `rm -rf`
+# passes can never overlap on the same directories.
+#
+# Invoked as `/bin/bash <path>` rather than executed: /boot is vfat and cannot
+# carry an exec bit.
+20 * * * * /bin/bash /boot/config/scripts/runner-cache-sweep.sh > /dev/null 2>&1

@@ -1,0 +1,11 @@
+-- Round 12 review R12-2: the class is declared PLAINLY first and reopened
+-- with a back-edge onto itself. Two declarations of one name union their
+-- parents (docs/03-reference/02-limitations.md, "which is what luals does"),
+-- so the union is what makes this a cycle at all — a first-declaration-wins
+-- harvest reads `ReopenRing -> []` and reports nothing.
+-- Reference-free like cyclic_class_unreferenced: the declarations alone must
+-- be enough for both tools.
+---@class ReopenRing
+
+---@class ReopenRing : ReopenRing
+---@field ring string

@@ -1,43 +1,45 @@
 # Backlog
 
-**The backlog is [GitHub issues on `flying-dice/luabox`](https://github.com/flying-dice/luabox/issues).**
-That is the only live tracker. This file is a pointer and a citation
+**The backlog is the issue tracker on `origin` —
+`gitlab.beluga-sirius.ts.net/flying-dice/luabox` (project 40).** That is the
+only live tracker (decision 14). This file is a pointer and a citation
 convention; it holds no work items of its own.
 
 ## Citing an issue
 
-The project moved from a private GitLab instance to GitHub mid-flight, and
-both trackers number from 1 — so a bare `#23` is genuinely ambiguous in
-anything written before the move. The convention, applied wherever the two
-ranges actually collide:
+- **`#N`** — a GitLab issue on project 40. Numbers `#1`–`#74` are the items
+  migrated from GitHub `flying-dice/luabox` with their numbers preserved, so
+  every `#N` written while GitHub was the tracker still resolves. Migrated
+  GitHub *pull requests* appear as issues labelled `migration-placeholder`;
+  they are history, not work.
+- **`GL#NNN`** — an issue on the earlier, archived GitLab project the codebase
+  lived in before its GitHub period (`GL#94`, `GL#102`, `GL#137`, …). Kept in
+  comments only where it is the honest provenance of a decision; never as
+  somewhere to go and look.
 
-- **`#N`** — a GitHub issue or PR on `flying-dice/luabox`. This is the
-  default; new references need no prefix.
-- **`GL#NNN`** — a historical GitLab issue, **archived and unreachable**.
-  Kept in comments only where it is the honest provenance of a decision;
-  never as somewhere to go and look.
+The two ranges collide (GitLab-era `GL#23` was differential execution; `#23` is
+a manifest-parsing rule), which is why the prefix exists. New references need
+no prefix.
 
-The collision is real today: GitLab #23 was differential execution, GitHub
-#23 is a manifest-parsing rule; GitLab #14 was the LSP tranche, GitHub #14 is
-a `---@source` bug. Anything above the GitHub high-water mark is
-unambiguously GitLab and left bare.
+## Where GitHub still matters
 
-## Archived: the GitLab backlog
+`github.com/flying-dice/luabox` is the public mirror and the release surface:
+`.github/workflows/release.yml` cuts a release when the owner pushes a tag
+(#27), and the Actions CI covers the macOS/Windows matrix the GitLab runners
+cannot yet. Its issue tracker is closed — do not file there.
 
-The GitLab instance (`gitlab.beluga-sirius.ts.net/flying-dice/luabox`) is
-**archived**. Its issues — the launch-gate milestone, the checker-deepening
-and LSP build-out waves, the `.luab` removal, the release machinery — all
-closed before the move, and their outcomes are recorded where they belong:
-[CHANGELOG.md](../../CHANGELOG.md) for what shipped, [DIRECTION.md](../../DIRECTION.md)
-for why. Two items outlived the instance and were re-filed on GitHub rather
-than left behind:
+## Archived: the first GitLab backlog
 
-- Marketplace publication of the editor extensions →
-  [#34](https://github.com/flying-dice/luabox/issues/34) (was GL#102).
-- Registry UX (`search`, `login`/auth) — **parked post-v1** with dependency
-  management itself (was GL#137). Not re-filed: the commands no longer
-  exist, and the luarocks.org direction that would bring them back is
-  recorded in [DIRECTION.md](../../DIRECTION.md) and SPEC.md §6.
+The launch-gate milestone, the checker-deepening and LSP build-out waves, the
+`.luab` removal and the release machinery all closed there, and their outcomes
+are recorded where they belong: [CHANGELOG.md](../../CHANGELOG.md) for what
+shipped, [DIRECTION.md](../../DIRECTION.md) for why. Two items outlived it:
+marketplace publication of the editor extensions (#34, was `GL#102`), and
+registry UX (`search`, `login`) — parked post-v1 with dependency management
+itself (was `GL#137`), recorded in [DIRECTION.md](../../DIRECTION.md) and SPEC §6.
 
-Nothing else from GitLab is pending. Do not add items here — open a GitHub
-issue.
+## Planning artefacts
+
+Root `STATUS.md` (current state), `docs/bots/ROADMAP.md` (milestones),
+`boards/improvement-sprint/` (sprint cards), `decisions/` (engineering
+decisions). Do not add items here — open an issue on `origin`.

@@ -37,15 +37,77 @@ every `doc.class` set carrying the name). A class carried more than once
 (`---@class Two` over two different tables) collects the members of both
 carriers.
 
+The union is what the cycle check (`LB0318`, below) walks too: `---@class W`
+followed by `---@class W : W` is a cycle, because `W`'s parents are the union
+of both declarations — it was not, for one release candidate, and the shape
+was silent in luabox while luals reported it.
+
 A same-name **field** declared twice is where luabox and luals part company.
-luabox keeps the **first** declaration, wherever it was written — inside one
-`---@class` block, in a second block for the same class, or in another file —
-and warns at the loser as `duplicate-doc-field` (`LB0311`), the same
-deterministic first-wins trade it makes for duplicate aliases (`LB0310`) and
-enums. luals instead *unions* the two declared types into `string|number`.
-Choosing the union would make a mistyped duplicate silently widen the field
-rather than be reported, so the warning plus a stable winner is the more useful
-answer; the divergence is here rather than in the code's favour.
+Within one file luabox keeps the **first** declaration — inside one
+`---@class` block or a second block for the same class — and warns at the
+loser as `duplicate-doc-field` (`LB0311`), the same deterministic first-wins
+trade it makes for duplicate aliases (`LB0310`) and enums. luals instead
+*unions* the two declared types into `string|number`. Choosing the union
+would make a mistyped duplicate silently widen the field rather than be
+reported, so the warning plus a stable winner reads as the more useful
+answer.
+
+**Across files the story is worse, and is tracked as #73: the winner is not
+project-wide and nothing warns.** Measured (this release and the merge base,
+byte-identical): the declaration in the *referencing* file wins, a file
+declaring neither gets the alphabetically-first declaring file's binding,
+and no `LB0311` fires — a project can hold `x: string` in one file and `x:
+number` in another, read both, and check clean. The same rule reaches
+generic parent instantiations (`C : Box<number>` here, `C : Box<string>`
+there) through this release's new parent-argument substitution. One rule,
+two mechanisms, only one of which diagnoses — until #73 lands, keep a
+class's declarations in one file if its members must mean one thing.
+
+**That reasoning was reached without consulting luals' implementation, and
+is being revisited** (#67). Read from `script/vm/` rather than inferred,
+luals unions same-rank duplicates for `---@field`, for a re-declared carrier
+method, and for a re-declared indexer — so a project luals checks cleanly
+can pick up a fresh `LB0300` here purely from the resolution rule, on code
+the author did not change. The warning is worth keeping; the type resolution
+changing the verdict is the part that breaks a drop-in migration. See the
+[class-merge precedence matrix](03-class-merge-precedence.md) for every cell
+and which of them luals agrees with.
+
+**Indexers follow two rules, and which one applies depends on how the key
+arrived.** A same-key `---@field [K] V` re-declared on one class name — two
+`---@class` blocks, same file or across files — is **first-wins**, the same
+deterministic rule a duplicate `---@field` follows, though without the
+`LB0311` warning the named-field case emits. Inherited keys split by shape:
+two *unrelated* parents (`---@class C : P1, P2`, each declaring the key) is
+**first-listed-wins**, while one ancestor reached twice through a generic
+diamond with *different* type arguments is **last-listed-wins**. These two
+inherited rules are measured against the pre-change binary rather than
+derived, because an intermediate build of this release collapsed them into a
+single last-wins rule and silently changed verdicts in both directions.
+
+**Correction: an earlier edition of this page described a field/indexer
+asymmetry on the unrelated-parents shape as intentional. It was a bug, not a
+design choice, and it has been fixed.** This page used to say a class's own
+`---@field` members resolve `C : P1, P2` **last**-listed-wins — the opposite
+of the indexer rule above — and called that the one deliberate asymmetry in
+an otherwise-consistent precedence table. That reasoning was built from
+luabox's own code comments and was never checked against
+lua-language-server, the tool this project is a drop-in for. Checked against
+luals 3.13.5's actual source (`script/vm/compiler.lua:369-375`, gated by
+`copyToSearched` at lines 424/510) and confirmed by measurement — swapping a
+class's parent order flips which parent luals enforces — luals resolves
+**first**-listed-wins for this shape, uniformly, for a `---@field`, a
+carrier-attached method, and an indexer alike; there is no asymmetry in the
+reference implementation to reproduce. luabox's field (and, by the same
+root cause, carrier-attached method) rule now matches: **two unrelated
+parents disagree on a plain field or method, and the first-listed one
+wins**, the identical rule indexer already had. A project with `---@class C
+: P1, P2` where the parents disagree on a shared member's type, previously
+resolved to P2's (last-listed) type under `luabox check`, now resolves to
+P1's (first-listed) — matching what `lua-language-server --check` already
+told that project. See the [class-merge precedence matrix](03-class-merge-precedence.md)
+(finding 6) and `CHANGELOG.md` for the full measurement and the user-facing
+statement.
 
 **Type parameters are scoped to the declaration that writes them.** Two
 declarations of a generic class may spell the parameter differently —
@@ -67,6 +129,209 @@ One thing that is **not** a union: a project file's own `---@class` still
 whole. That is the escape hatch — your declaration corrects the packaged one
 rather than merging with it — and it is a different axis from duplicate
 declarations in code you wrote.
+
+### `---@class` ancestry is bounded: 200 links deep, 200 re-resolutions wide (`LB0317` / `LB0318` / `LB0319`)
+
+Resolving a `---@class` walks its ancestors recursively. Two hard limits bound
+that walk, and a class that trips either one resolves **incompletely** —
+members past the point the walk stopped are not in its shape, so reads of them
+are unchecked. Both limits are luabox's own; there is nothing to opt out of
+them beyond the strictness ladder below.
+
+| Limit | Value | What trips it | Code | Fix |
+|---|---|---|---|---|
+| `MAX_ANCESTRY_DEPTH` | 200 links | a single-inheritance chain longer than 200 (`C0`, `C1 : C0`, … `C201 : C200`) | `LB0317` | flatten the hierarchy, or declare the members you actually read nearer the leaf |
+| — | — | a class reachable from itself (`A : A`, or `A : B` / `B : A`) | `LB0318` | break the loop; a mutual reference is a `---@field`, not an `extends` |
+| `MAX_ANCESTRY_RESOLUTIONS` | 200 re-resolutions | the same generic ancestor reached through more than one parent and **bound differently on each branch**, repeated enough times (`L1 : Box<number>`, `R1 : Box<string>`, `C1 : L1, R1`, ×N) | `LB0319` | bind a shared generic ancestor the same way on every branch, or restructure so it is reached once |
+
+`LB0318` is the one of the three that does not wait for a walk: `luabox check`
+also finds cycles in the *declared* class graph before anything is resolved,
+so a cyclic class in a types file nothing references is reported too — see the
+measurement below. The other two are properties of the resolution itself.
+
+The two budgets bound different things and are reported separately on purpose:
+depth protects the native stack (an unbounded walk aborts the process on a
+host with a small thread stack — an editor embedding the language server is
+exactly such a host), while the cost budget bounds the *re*-work a diamond
+conflict forces. Flattening a hierarchy fixes the first and does nothing for
+the second, so reporting one as the other advises the wrong fix. The cost
+budget counts **re**-resolutions only: a hierarchy that is merely large —
+hundreds of generated `---@class` declarations, each visited once — does not
+trip it.
+
+**The strictness ladder is the same as every other `LB03xx`.** `[types]
+strict = true` reports `error` (exit 1); `[types] strict = false` downgrades
+to `warning` (exit 0); `Strictness::None`, reachable programmatically but not
+from a manifest, reports nothing. Per-rule suppression names:
+
+| Code | `---@diagnostic disable[-line\|-next-line]:` name | whose name |
+|---|---|---|
+| `LB0317` | `class-ancestry-too-deep` | luabox's own — luals has no depth budget to name |
+| `LB0318` | `circle-doc-class` | **luals'** — its own name for the same finding |
+| `LB0319` | `class-ancestry-too-costly` | luabox's own — luals has no cost budget to name |
+
+`LB0318` borrows luals' spelling because luals reports this shape too (see
+the measurement below), so the directive a luals user already writes silences
+LB0318 unchanged. It was `cyclic-class-ancestry` in pre-release drafts of this
+page, on an unmeasured claim that luals had no counterpart; the name was
+corrected before release, so nothing in the wild breaks.
+
+**Suppression is scoped to the file that DECLARES the class**, not the file
+that read it. All three diagnostics are anchored at the `---@class` line the
+message names, so a directive has to sit in *that* file — a
+`disable-next-line` above the declaration, or a file-wide `disable` at the top
+of it. A directive in the file that merely consumes the class does nothing,
+even though that is where the error was reported from.
+
+**The cross-file form works under `luabox check` only.** When the
+declaration is in file A and the diagnostic is reported while checking file
+B, `luabox check` reads A's directives and suppresses it; the **language
+server does not** — it checks one open document at a time and never sees A's
+directives, so the editor keeps showing the diagnostic even though the CLI
+is green. This is the one measured exception to the editor/CLI parity claim
+made later in this page, it applies to all three ancestry codes, and it has
+no issue of its own yet — it belongs to the same LSP-parity family as #70.
+It is a *diagnostic* divergence, and it is unrelated to which declaration
+each side resolves a member to: hover, goto-definition and `luabox check`
+read that from one merged answer. Same-file suppression behaves identically
+in both. No workaround beyond fixing the ancestry itself or suppressing from
+the file the editor has open, which only works when that is also the
+declaring file.
+
+The one exception is a class declared **only in a `[types] defs` package**.
+Nothing in the project declares it, and a definition package's own comments
+are never scanned for directives, so there is no declaration line to reach:
+the diagnostic attaches to **line 1 of each consuming file** instead. That is
+where the directive goes — a file-wide `---@diagnostic disable:
+class-ancestry-too-deep` at the top of the consuming file, or a
+`disable-line` on line 1 itself — both measured against the shipping binary.
+A directive written next to the declaration inside the `.d.lua` has no effect:
+definition packages are not project sources and are never scanned for
+directives at all.
+
+**Measured against lua-language-server 3.13.5** (the pinned binary,
+`--checklevel=Warning`) — and the answer is not the same for all three:
+
+| shape | luals 3.13.5 | pinned by |
+|---|---|---|
+| a 260-link straight chain | **silent** — no depth budget at all | corpus row `deep_chain_over_depth_limit` (intentional divergence) |
+| `---@class A : A` | reports `circle-doc-class` | corpus row `cyclic_class_self` (agreement) |
+| `A : B` / `B : A` | reports `circle-doc-class` on both | corpus row `cyclic_class_mutual` (agreement) |
+| a cyclic class **nothing references** | reports `circle-doc-class` — its check is declaration-driven | corpus row `cyclic_class_unreferenced` (agreement) |
+| a class declared plainly and **reopened** with a back-edge (`---@class W` then `---@class W : W`) | reports `circle-doc-class` **once**, on the reopening declaration | corpus row `cyclic_class_reopened` (agreement) |
+| the same cyclic class declared in **two files** | reports `circle-doc-class` **twice**, one per declaration | `check_cmd::tests::a_cyclic_class_declared_in_two_files_reports_once_per_declaration` (the corpus compares the code *set*, never the count) |
+| a conflicting generic diamond | silent — 3.13.5 has no generic classes at all | not separately pinned; see the generics rows |
+
+So LB0317 and LB0319 are luabox being deliberately stricter (a project clean
+under `lua-language-server --check` can fail `luabox check` on depth or cost
+alone), while **LB0318 is parity** — both tools reject a cyclic `---@class`,
+and both reject it **from the declaration alone**, whether or not anything in
+the project ever resolves the class, on **both** luabox surfaces: `luabox
+check` and the language server run the same declared-graph cycle pass, so a
+cycle is never red in one and green in the other. Attribution matches too:
+one diagnostic per declaration that carries a cycle edge, which is why the
+reopened row above is one and the two-file row is two. An earlier draft of
+this page said luals "reports nothing for any of these three shapes"; the
+cycle half of that was asserted rather than measured, and is false. A later
+one claimed the parity flatly while luabox's own LB0318 came only from a
+resolution walk, so a cyclic class in an unreferenced types file was flagged
+by the editor and green in `luabox check`. The round after that closed the
+CLI half only, and the divergence simply changed sign — CI red, editor green
+— until the cycle pass moved into `luabox-types` where both surfaces run it.
+The corpus rows above are the measurement, re-derived on every run of
+`scripts/tests/luals-differential.sh` rather than restated here.
+`luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
+for each.
+
+### Malformed `---@class` headers: reported at the declaration, one finding per header (#69)
+
+Every row above assumes `---@class` parses into a well-formed class at all.
+Four ways a header can fail to — a missing name, a name token the grammar
+can't lex as an identifier, a trailing comma in the `extends` list, and a
+bare `---@class` with nothing after it — are now reported at the declaration
+under two codes:
+
+| Shape | luabox | lua-language-server 3.13.5 |
+|---|---|---|
+| `---@class : Base` (no name, colon parent) | `LB0320` at the declaration | `luadoc-miss-class-name` ("`<class name> expected`") at the declaration, plus `doc-field-no-class` on the `---@field` line beneath it |
+| `---@class 123abc` (non-identifier name) | `LB0320` at the declaration, quoting the name back | identical to the row above — luals treats a name token it can't lex as an identifier the same as a missing name |
+| `---@class A : P,` (trailing comma, `P` undeclared) | `LB0321` at the declaration **plus** `LB0305 unknown type name \`P\`` — two mistakes, two findings | `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the comma, **plus** an ordinary `undefined-doc-class` on `P` |
+| bare `---@class` (no name, no colon) | `LB0320` at the declaration; a consumer's `---@type` reference still reports its own `LB0305` | `luadoc-miss-class-name` + `doc-field-no-class` at the declaration |
+
+Both tools now report at the declaration for all four shapes.
+
+**The remaining divergence is message count, not silence.** luals adds a
+`doc-field-no-class` per orphaned `---@field` under a nameless header;
+luabox reports the header once and leaves the fields alone. One mistake, one
+diagnostic: the fields are not independently wrong, and a generated block
+with twenty fields under one typo'd header would otherwise produce twenty-one
+findings for one edit. `LB0320` and `LB0321` are deliberately separate for
+the opposite reason — an unusable class *name* and a bad entry in the
+*extends list* have different causes and different fixes, and a header can
+carry both at once (`---@class :`), so each gets its own.
+
+**`LB0321` covers more than a stray separator, and says so carefully.** The
+type parser has one recovery node for an entry it cannot read, and it does not
+record *why* — so `---@class A : ?`, where a token is present and merely
+unreadable, is indistinguishable from `---@class A : P,`, where nothing is
+there at all. The message says the entry is not a class name, which holds for
+both, rather than claiming a name is missing, which would be false on the
+first. This is an error under `[types] strict = true`, so the wording has to
+be true of every shape that reaches it.
+
+**Where `LB0321` stops: a parent whose name reads.** `---@class A : Base<?>`
+is *not* this finding. The entry heads with `Base`, which resolves and whose
+members are inherited exactly as `: Base`'s are — nothing is dropped, so the
+message ("an entry that is not a class name"), the note ("the entry is
+ignored") and the remedy ("replace the entry with the parent it was meant to
+name") would all be false of it, and at `Severity::Error` the last one tells
+the user to delete a parent that works. The rule stops at a bare name and
+nowhere else. A name written *under* something is not a parent either:
+measured, `: Base?`, `: Base[]`, `: (Base)` and `: Base|Base` each leave
+their class with no members — the same as `: { x: number }`, a `fun` type,
+or no extends list at all — where `: Base` inherits. So every entry but a
+bare name contributes no parent whether or not the parser choked inside it,
+the note holds there, and an unreadable token anywhere in one is reported:
+`---@class A : Base<?>[]` is this finding, `---@class A : Base<?>` is not.
+
+An unreadable *type argument* is a real mistake and is currently reported
+nowhere: `luacats`' recovery errors do not leave the syntax crate, so
+`---@field x Base<?>` is silent on the same axis. That gap is the
+type-argument axis, not the extends-list one, and it is not what this code
+covers.
+
+**What a class name has to be.** One or more dot-separated segments
+(`geometry.Point`), each starting with a letter, `_`, or a non-ASCII
+character and continuing with letters, digits, `_` or non-ASCII. The grammar
+`luacats` lexes names with is deliberately looser — any run of
+`[A-Za-z0-9_.]` — so a mistyped name is captured whole and quoted back at the
+user rather than truncated at the first bad character into something they
+never wrote.
+
+That rule has one owner, `luacats::is_type_name`, and it lives beside the
+lexers it makes a claim about rather than in the crate that raises the
+diagnostic. `LB0320`'s message tells the user that nothing can reference the
+class; that is an assertion about the *reference-side* parser, so
+`name_is_spellable_by_the_type_parser` pins the round trip in both directions
+— every name the rule accepts parses back as itself, and every name it
+rejects does not. Loosening one lexer without the other now fails a test
+instead of silently turning the diagnostic into a false positive.
+
+**Strictness ladder and suppression, as for every other `LB03xx`:**
+
+| Code | `---@diagnostic disable[-line\|-next-line]:` name | whose name |
+|---|---|---|
+| `LB0320` | `luadoc-miss-class-name` | **luals'** — measured firing on all three shapes it covers |
+| `LB0321` | `luadoc-miss-class-extends-name` | **luals'** — same |
+
+`crates/luabox-types/tests/malformed_class_headers.rs` covers each shape
+against a control differing in exactly one respect, and
+`crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
+`malformed_class_headers_m66` — which pinned the *silence* while the gap was
+open, `#[ignore]`d — now pins the four shapes' diagnostics and runs in the
+default suite. The `verdict-differential` corpus carries a row per shape, so
+this axis is covered by the self-regression gate too. `luabox explain LB0320`
+(and `LB0321`) prints the full worked fix.
 
 ### LuaCATS tags: the full vocabulary is enforced
 
@@ -672,7 +937,7 @@ What that leaves, stated plainly:
   Neovim, OpenResty — still wants a `defs/` package. The harvest contributes
   type declarations and export types, not ambient globals.
 - **Argument checking at a rock function's call site now happens**, and this
-  bound is gone ([#46](https://github.com/flying-dice/luabox/issues/46)).
+  bound is gone (#46).
   `local m = require("rock"); m.f("wrong")` reports `LB0300`, and the wrong
   *number* of arguments reports `LB0301`, exactly as the same call written in
   the same file does — it is one shared signature-checking path, so the
@@ -691,18 +956,17 @@ What that leaves, stated plainly:
   errors about code that claims nothing. A rock with no LuaCATS annotations
   still gives you nothing, per the first bullet above.
 
-  Three edges remain out, each far narrower than the bound it replaces:
+  Two edges remain out, each far narrower than the bound it replaces (a
+  third — a member declared only as a `---@field` on an exported
+  `---@class`, never assigned — closed with #56: the carrier now crosses
+  the boundary as the class it carries, and the class's declared surface is
+  exactly what `---@field` lines populate, so the declared and attached
+  spellings are argument-checked identically):
 
   - **A dynamic require path** — `require(name)` for a computed `name` —
     resolves to no module, so its result stays `unknown` and nothing about it
     is checked. Static string literals are the resolvable set, the same set
     the bundler accepts.
-  - **A member declared only as a `---@field`** on an exported `---@class`,
-    with no `function M.f` defining it, does not reach the consumer: a
-    module's export type is the shape of the value it returns, and a
-    `---@field` line declares a member without assigning one. The same class
-    with its members *attached* (`function Api.send(...)`) is checked
-    normally. What is missing here is the member, not its signature.
   - **A function re-exported from a second `require`** — module B does
     `local a = require("a"); return { f = a.f }` and a consumer calls
     `require("b").f(...)`. B's *own* requires are deliberately left
@@ -726,9 +990,13 @@ What that leaves, stated plainly:
     boundary. **Only a trailing run counts.** A nil-admitting parameter
     *followed by a required one* still requires an argument, because a caller
     cannot skip a middle argument in Lua without writing `nil` in its place —
-    relaxing that slot would let a genuinely short call through. luals's exact
-    behaviour in that position could not be verified here, and this is the
-    direction that cannot be wrong in the dangerous way. Equally narrow:
+    relaxing that slot would let a genuinely short call through. This bound
+    was taken conservatively when luals could not be run here; it has since
+    been **measured**: lua-language-server 3.13.5 reports `missing-parameter`
+    for exactly that call, so the trailing-only rule matches luals, and the
+    `nontrailing_nil_param_omitted` row of the luals parity gate
+    (`scripts/tests/luals-differential.sh`, CI job `luals-parity`) keeps it
+    measured. Equally narrow:
     "admits `nil`" means the type *says* `nil`. `---@param b any` and
     `---@param b unknown` accept `nil` assignably but only decline to
     constrain the parameter, so they stay required.
@@ -760,38 +1028,154 @@ it points at is still not planned for 0.x; nothing needs it now.
 Your `*.rockspec` and luarocks own everything else (adding, updating,
 publishing), and you run your program with whatever Lua you already have.
 
-### A `---@class` module export: editor and CI both stop short (#54)
+### A `---@class` module export: closed, in both spellings (#54 → #56)
 
-The editor reads `require` bindings through the same resolver the type pass
-does, so hover and completion agree with CI for the ordinary `local M = {} …
-return M` module. One shape does not close, in **both** of its spellings: a
-module whose export is a `---@class`. The class's `---@field`s live in the
-declaring file's ambient environment, and the per-file view the editor
-surfaces are built on cannot reach it — so **the module's members get no
-hover and are not offered by completion, either way**.
+This section used to record the one shape that did not close: a module
+whose export is a `---@class`. The class's `---@field`s live in the
+workspace ambient environment, and the per-file view the editor surfaces
+were built on could not reach it. Two things closed it (#56): the export
+now crosses the `require` boundary **as the class it carries** — the
+workspace-global identity, which is what luals resolves a require to — and
+hover/completion resolve class members through the **same merged ambient
+environment** the checker enforces, so the editor cannot offer what
+`luabox check` rejects or omit what it accepts.
 
-What is left of the binding differs between the two spellings, and the
-difference is measured, not assumed. Both rows are pinned by fixtures —
-`tests/features/lsp/hover-require.feature` for the editor column,
-`tests/features/frontend/require.feature` for CI.
+**One measured exception, on suppression rather than resolution.** A
+`---@diagnostic disable: class-ancestry-too-deep` / `circle-doc-class` /
+`class-ancestry-too-costly` written in the file that DECLARES the class
+silences the diagnostic under `luabox check` but not in the editor: the
+language server checks one document at a time and cannot read the declaring
+file's directives, so it emits what the CLI has been told to drop. The
+resolution claim above is unaffected — the same members resolve the same way
+in both — but "the editor omits what `luabox check` accepts" does not hold
+for cross-file-suppressed ancestry diagnostics. Detail and scope are in the
+ancestry-limits section above; no issue of its own yet, same LSP-parity
+family as #70.
+
+The table below is still measured, not assumed — the same fixtures pin the
+new behaviour: `crates/luabox-cli/tests/features/lsp/hover-require.feature`
+for the editor columns, `crates/luabox-cli/tests/features/frontend/require.feature`
+for CI.
 
 Given `---@class Point` / `---@field x number` in `point.lua` and
 `local p = require("point")` in the consumer:
 
 | module spells its export as | binding hovers as | `p.x` hover | `p.` completion | `luabox check` |
 | --- | --- | --- | --- | --- |
-| a class **instance** — `---@type Point` on the returned local | `local p: Point` | none | omits `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
-| a class **carrier** — `---@class Point` over `local P = {}` | `local p: {  }` (the structural table the carrier is) | none | omits `x` | lenient: `p.x` crosses as `unknown` and `p.nope` is accepted |
+| a class **instance** — `---@type Point` on the returned local | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a class **carrier** — `---@class Point` over `local P = {}` | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a **generic** carrier — `---@class Box<T>` over `local B = {}` | the structural table, not the name `Box` | the member's erased type, not `Box.item` | offers `item` | **lenient**: `b.nope` is accepted (below) |
 
-So the instance spelling is the one where the editor is genuinely narrower
-than CI. The carrier spelling is not an editor gap at all — both sides see
-the structural table, and they agree.
+The first two rows are symmetric now; the third is the exception, and it is
+an exception in three of the four columns rather than only in the checker's
+— the export crosses as the monomorphised template, and a template has no
+class name for the editor to render either. Naming the class directly
+(`---@param p Point`, `---@type Point`) is equivalent rather than a
+workaround — class names are workspace-global, so the editor resolves a
+class's members with no `require` in sight, exactly as the checker always
+did.
 
-**The way to get the class enforced is to name it**: `---@param p Point`, or
-`---@type Point` on the binding. Class names are workspace-global, so the
-`require` is not what carries the type — no `require` is needed for the type
-at all. With the class named, members are typed, hovered, completed and
-checked on both sides.
+**"Enforces" means the class's *declarations* are the member list**, so two
+shapes deserve naming — both measured, both with a spelling that resolves
+them.
+
+*A member attached under a computed key.* A carrier populated in a loop —
+
+```lua
+---@class Handlers
+local H = {}
+for _, name in ipairs({ "one", "two" }) do
+  H[name] = function() return name end
+end
+return H
+```
+
+— has members at runtime that are declared nowhere, so `h.one` in a consumer
+is `LB0306`. This is the one shape the closure genuinely narrows: it was
+accepted before the export crossed as the class. It is also **luals parity,
+not extra strictness** — lua-language-server 3.13.5 reports `undefined-field`
+on exactly the same read, measured as a row of the parity gate
+(`dynamic_key_carrier_require` in `scripts/tests/luals-differential/`).
+Declare the key space and both tools go clean:
+
+```lua
+---@class Handlers
+---@field [string] fun(): string
+```
+
+*A member reached through an undeclared `__index`.* The same rule in its
+other spelling: `local T = setmetatable({}, { __index = Proto })` on a
+`---@class` carrier borrows `Proto`'s members at runtime, and `Proto` is a
+plain table nothing declares — so `t.hello` through a `require` is `LB0306`.
+luals agrees here too (`undefined-field`, row
+`metatable_index_carrier_require`). Declare the member on the class, or make
+the delegate a class the carrier names as a parent (`---@class Thing : Proto`),
+and it resolves — an ordinary inheritance chain is unaffected.
+
+Statically visible attachments need nothing: dotted functions
+(`function H.one()`), colon methods, data fields, table-literal carriers and
+members assigned from a `require` all resolve as before — measured clean
+either side of the change.
+
+*A carrier with an unbound type parameter — the exception to "enforces".* A
+class name carries no type arguments, so `---@class Box<T>` crossing a
+`require` has no `T` to bind. Its members type as `unknown` — the same thing
+a bare `Box` reference means in an annotation — rather than leaking the
+parameter name into a consumer that cannot name it. Naming the arguments on
+the binding types them:
+
+```lua
+---@type Box<number>
+local b = require("box")
+```
+
+The mechanism has a cost worth stating plainly, because it is the one place
+the enforcement claim above does not hold: such a carrier crosses as the
+**monomorphised template** rather than as the class name, and a template is
+a structural table, which carries no member list to enforce. So `b.nope` on
+a generic carrier is **clean**, where the identical read on a plain
+`---@class Crate` is `LB0306` — the two differ by `<T>` alone. Both
+directions are pinned as fixtures
+(`an_undeclared_member_on_a_generic_carrier_stays_lenient` and
+`a_plain_carrier_still_crosses_as_the_class_itself` in
+`crates/luabox-types/tests/cross_file_require.rs`), so the rule cannot flip
+back unnoticed. luals 3.13.5 has no generic-class support at all, so the
+generic rows in the parity corpus record where the tools part company and
+why (`generic_carrier_require`, `generic_carrier_require_bound`).
+
+**"Unbound" includes a parameter inherited from a parent**, and a parent's
+arguments now bind. `---@class Sub : Base<number>` over `---@class Base<U>` /
+`---@field item U` used to bind nothing at all — the argument was dropped
+when the declaration was lowered, so `Sub` inherited `item: U` and a consumer
+was told `found U`, a name it can neither produce nor act on. The argument
+binds the parent's parameter where the members merge, at every level of the
+chain (`---@class Mid<M> : Slot<M>` passes its own parameter up), so `Sub`
+has nothing unbound left: `item` is `number`, and the export keeps the class
+identity and its enforcement.
+
+What stays unbound is a generic parent named **without** arguments
+(`---@class Sub : Base`) — there is no argument to bind, so `Sub`'s members
+fall under the rule above and the export crosses as the template. Both
+directions are fixtures (`a_parent_type_argument_binds_the_inherited_member`
+and `a_parent_written_bare_leaves_its_parameter_unbound_and_erased`).
+A **reference site**'s monomorphisation reaches inherited members too, as of
+this change: `---@type Leaf` over `---@class Slot<S>` / `---@class Mid<M> :
+Slot<M>` / `---@class Leaf : Mid<number>` types `Leaf.slot` as `number`,
+where it previously read `unknown`. The template a reference instantiates is
+now the class's merged shape rather than its own `---@field` bodies alone,
+so a direct generic reference and a plain one agree.
+
+**What a generic reference still does not carry is the class identity.**
+`Ty::Named` has no room for type arguments, so `---@type Box<number>` lowers
+to the monomorphised *table* — its declared members are typed correctly, but
+an **undeclared** member on it is lenient (`LB0300`, `found unknown`) rather
+than `LB0306`. It is the same exception the export seam has, reached by a
+different route, and it applies to every generic reference rather than only
+to a carrier crossing `require`. Pinned as
+`undeclared_members_on_a_generic_reference_stay_lenient_lb0300_not_lb0306`.
+Closing it means growing `Ty::Named` an argument list — a type-representation
+change touching 125 construction and match sites across 18 files — which is
+deliberately not in this change's scope.
 
 ### `build --mode love` requires an external zip tool
 

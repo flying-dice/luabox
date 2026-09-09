@@ -11,3 +11,25 @@ examples/**/doc/
 
 # IDE state
 .idea/
+
+# GitLab CI scratch. GitLab can only cache and upload paths under the project
+# directory, so .gitlab-ci.yml puts CARGO_HOME, the pinned pwsh/luals trees,
+# the mutants report and the coverage lcovs here rather than in $HOME or a
+# temp dir. They must be IGNORED, not merely untracked: cargo-mutants copies
+# the source tree for every mutant and skips git-ignored paths, so an
+# unignored cache directory would be duplicated into each build.
+/.cargo/
+/.ci-tmp/
+/.luals/
+/.pwsh/
+/mutants-out/
+/lcov-unit.info
+/lcov-e2e.info
+
+# Harness-generated bot manifests. Written by the local bots tooling with
+# absolute paths rooted at the generating machine's checkout, refreshed with a
+# new `updatedAt` on every regeneration, and read by nothing in this repo.
+# Each harness regenerates them locally; committing one machine's copy only
+# ever produced paths that resolve nowhere else.
+/.claude/bots-manifest.json
+/.codex/bots-manifest.json

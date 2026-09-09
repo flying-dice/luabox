@@ -2,6 +2,7 @@
 name = "luabox-lint"
 description = "luabox: type-informed lint rules over the shared analysis (clippy analog)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +11,6 @@ rust-version.workspace = true
 [dependencies]
 luabox-syntax.workspace = true
 luabox-hir.workspace = true
-luabox-types.workspace = true
 luabox-diag.workspace = true
 # The `[lint]` vocabulary (`LintLevel`, `LintTier`) lives with the manifest
 # model; this crate re-exports it and owns the one mapping onto its own
@@ -19,6 +19,12 @@ luabox-diag.workspace = true
 # depends on nothing in this workspace.
 luabox-manifest.workspace = true
 rowan.workspace = true
+
+[dev-dependencies]
+# Test-only: the rule fixtures resolve the stdlib baseline through
+# `luabox_types::stdlib_defs`, exactly as `luabox lint` does. No rule in
+# `src/rules` touches the checker, so it stays off the normal build edge.
+luabox-types.workspace = true
 
 [lints]
 workspace = true

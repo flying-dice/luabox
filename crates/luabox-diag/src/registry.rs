@@ -163,6 +163,31 @@ static REGISTRY: &[Entry] = &[
         explain: LB0316,
     },
     Entry {
+        code: Code::new(317),
+        title: "class ancestry deeper than the resolver walks",
+        explain: LB0317,
+    },
+    Entry {
+        code: Code::new(318),
+        title: "cyclic `---@class` ancestry",
+        explain: LB0318,
+    },
+    Entry {
+        code: Code::new(319),
+        title: "`---@class` ancestry too costly to resolve",
+        explain: LB0319,
+    },
+    Entry {
+        code: Code::new(320),
+        title: "`---@class` header with no usable class name",
+        explain: LB0320,
+    },
+    Entry {
+        code: Code::new(321),
+        title: "`---@class` extends list entry that is not a class name",
+        explain: LB0321,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -1239,6 +1264,362 @@ fetch()   -- not flagged, this line only
 
 Mark the enclosing function `---@async`, move the call into an async function,
 or suppress the diagnostic if the call is genuinely synchronous-safe.
+";
+
+const LB0317: &str = "\
+# LB0317: class ancestry deeper than the resolver walks
+
+A `---@class` inherits through a parent chain longer than luabox resolves
+(200 links). Members declared above that depth are **not** in the resolved
+shape, so reads of them are unchecked rather than silently correct — which is
+why this is reported rather than truncated quietly.
+
+```lua
+---@class C0
+---@field deep string
+
+---@class C1 : C0
+---@class C2 : C1
+-- ... 200+ links ...
+---@class C201 : C200   -- LB0317: ancestry deeper than 200 links
+```
+
+**Why there is a limit at all.** Resolving a class walks its ancestors
+recursively, one native stack frame per link. The ceiling is the thread's
+stack, which differs by entry point — an editor embedding the language
+server can run the walk on a thread with no explicit stack budget at all —
+so an unbounded walk aborts the process on some hosts and not others, with
+no diagnostic and no file name. A fixed limit well under the smallest
+measured floor turns that into this message.
+
+**What to do.** A 200-deep inheritance chain is almost always generated
+code or a mistake — a cycle written as a chain, or a generator emitting one
+class per row. Flatten the hierarchy, or declare the members you actually
+read on a class nearer the leaf. A genuine cycle (`A : B`, `B : A`) is
+LB0318, not this, and terminates safely on its own.
+
+**luabox-only.** lua-language-server 3.13.5 reports nothing on a straight
+inheritance chain of 260 links — measured directly against the pinned binary
+at `--checklevel=Warning`, and pinned as the `luals` column of the
+`luals-differential` corpus row `deep_chain_over_depth_limit`, an intentional
+divergence. luals resolves such a chain without a depth budget, so a project
+clean under `lua-language-server --check` can fail `luabox check` on this
+code alone. (LB0318, the cycle case, is the opposite: luals reports it too.)
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: class-ancestry-too-deep`
+suppresses it. Both silence the diagnostic without restoring the missing
+members — the walk still stops at the limit.
+
+**Where the directive goes: the file that DECLARES the class**, not the file
+that reads it. The diagnostic is anchored at the `---@class` line the message
+names, so that is the line a directive has to reach:
+
+```lua
+-- shapes.lua — the file that DECLARES C201
+---@diagnostic disable-next-line: class-ancestry-too-deep
+---@class C201 : C200
+```
+
+```lua
+-- main.lua — the file that merely READS it: this does nothing
+---@diagnostic disable-next-line: class-ancestry-too-deep
+---@type C201
+local c = {}
+```
+
+This holds across files **under `luabox check`**: a class another project file
+declares is suppressed from *that* file, not from the one whose check reported
+it.
+
+**Editor caveat — cross-file suppression is CLI-only today.** The language
+server checks one open document at a time and has no way to read the
+declaring file's directives, so it never suppresses a diagnostic whose
+`---@class` line lives in another file. Concretely: the directive above
+greens `luabox check`, and the editor keeps showing LB0317 on the consuming
+file until the limit itself is fixed. Same-file suppression works in both.
+This is an editor/CLI parity gap in the same family as
+<https://github.com/flying-dice/luabox/issues/70>; it has no issue of its own
+yet.
+
+**The exception: a class declared only in a `[types] defs` package.** Nothing
+in the project declares it, and a definition package's own comments are never
+scanned for directives, so there is no declaration line to reach. The
+diagnostic attaches to **line 1 of each consuming file** instead, and that is
+where the directive goes — a file-wide `---@diagnostic disable:
+class-ancestry-too-deep` at the top, or a `disable-line` on line 1 itself:
+
+```lua
+---@diagnostic disable: class-ancestry-too-deep
+---@type C201   -- C201 comes from defs/, not from this project
+local c = {}
+```
+";
+
+const LB0318: &str = "\
+# LB0318: cyclic `---@class` ancestry
+
+A `---@class` is its own ancestor — directly (`---@class A : A`) or through
+a loop (`A : B`, `B : A`). The resolver stops at the back-edge, so nothing
+crashes and nothing hangs, but every member declared past it is **not** in
+the resolved shape.
+
+```lua
+---@class Node : Node        -- LB0318: `Node` is its own parent
+---@field value string
+
+---@class A : B              -- LB0318: `A` is reachable from `A`
+---@class B : A
+```
+
+**Why this is reported.** Before this diagnostic existed the cycle resolved
+in silence: the class kept whatever members the walk reached before the
+back-edge, and a user who meant to extend something else — a typo, a
+copy-paste, a rename that closed a loop — got no signal anywhere. The
+alias axis has reported its own version of this as LB0314 since #123; this
+is the class axis.
+
+**What to do.** Break the loop. A class cannot extend itself, so one of the
+`---@class X : Y` lines names the wrong parent. If the two types genuinely
+refer to each other, that is a *field* relationship, not an inheritance one
+— `---@field other B` on `A` is fine and is not a cycle.
+
+**Parity with lua-language-server.** luals 3.13.5 reports `circle-doc-class`
+(\"Circularly inherited classes\") on both shapes above — the self-parent and
+the mutual pair — at its default check level. This is not luabox being
+stricter; the two tools agree that a cyclic `---@class` is a finding, and the
+`luals-differential` corpus rows `cyclic_class_self` and `cyclic_class_mutual`
+measure that agreement against the pinned binary rather than asserting it.
+(LB0317 and LB0319 *are* luabox-only; this one is not.)
+
+Parity **on the declaration**, not only on a class something resolves: luals
+fires from the `---@class` node itself, and so do both luabox surfaces — a
+cyclic class in a types file nothing references anywhere is reported by
+`luabox check` AND by the language server, which run the one declared-graph
+cycle pass. That was not true before: LB0318 came only from the resolver's
+back-edge, so an unreferenced cycle was flagged in the editor and silent on
+the command line; the fix for that landed on the CLI alone for one release
+candidate and merely swapped the sides. The corpus row
+`cyclic_class_unreferenced` (a self-parent class with zero uses — no
+`---@type`, no local, no member read) is the measurement.
+
+Attribution matches the oracle too: **one diagnostic per declaration that
+carries a cycle edge**. A class declared plainly and then reopened with a
+back-edge (`---@class W` then `---@class W : W`) is one finding, on the
+reopening line — the plain declaration is not a cycle edge. The same cyclic
+class declared in two files is two findings, one per file. Both measured
+against the pinned 3.13.5. Parity holds on the shapes measured, up to luals'
+own ceiling: its walk stops after 999 ancestors, so an inheritance ring of
+~1,000 or more declarations is silent there while luabox's unbounded walk
+still reports it.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: circle-doc-class` suppresses it.
+That name is luals' own, so the directive you already write for
+`circle-doc-class` silences LB0318 unchanged — no second vocabulary.
+
+**Where the directive goes: the file that DECLARES the class**, not the file
+that reads it — the diagnostic is anchored at the `---@class` line the
+message names, and every class the cycle reaches is named separately, so a
+mutual `A : B` / `B : A` spanning two files needs the directive in both:
+
+```lua
+-- node.lua — where `Node` is declared
+---@diagnostic disable-next-line: circle-doc-class
+---@class Node : Node
+```
+
+A directive in a file that merely *reads* `Node` does nothing.
+
+**The directive works in the editor too**, unlike LB0317's: the language
+server's own cycle pass reads the DECLARING file's text through the same
+directive scanner the command line uses, so a `disable-next-line:
+circle-doc-class` written next to the declaration silences it in both places
+— including when the declaring file is not the one you have open. (LB0317
+still has the older caveat; see `luabox explain LB0317`.)
+
+**The exception: a class declared only in a `[types] defs` package.** Nothing
+in the project declares it, and a definition package's own comments are never
+scanned for directives, so the diagnostic attaches to **line 1 of each
+consuming file** instead. Put a file-wide `---@diagnostic disable:
+circle-doc-class` at the top of that file, or a `disable-line` on line 1.
+";
+
+const LB0319: &str = "\
+# LB0319: `---@class` ancestry too costly to resolve
+
+Resolving this class forced the merge walk to re-resolve the same ancestors
+more times than it will spend. Members past the point it stopped are **not**
+in the resolved shape.
+
+This is about *cost*, not depth — LB0317 is the depth one, and the fix for it
+(flatten the hierarchy) does not help here. What drives this is a **diamond
+conflict**: the same generic ancestor reached through more than one parent,
+bound differently on each branch, so every disagreement invalidates work
+already done and the walk redoes it.
+
+```lua
+---@class Box<T>
+---@field item T
+
+---@class L1 : Box<number>
+---@class R1 : Box<string>
+---@class C1 : L1, R1     -- `Box` reached twice, bound two ways
+
+-- ... repeated across many such groups ...
+```
+
+**What to do.** Make the conflict go away rather than making the hierarchy
+smaller: bind a shared generic ancestor the same way on every branch that
+reaches it, or restructure so it is reached once. A hierarchy that is merely
+*large* — hundreds of generated `---@class` declarations, each visited once —
+does not trip this and never should; if you are seeing it on a hierarchy with
+no repeated generic ancestor, that is a bug worth reporting.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: class-ancestry-too-costly`
+suppresses it. Both silence the diagnostic without restoring the missing
+members — the walk still stops.
+
+**Where the directive goes: the file that DECLARES the class**, not the file
+that reads it. The diagnostic is anchored at the `---@class` line the message
+names — the root of the walk, which is usually the class *at the bottom* of
+the diamond, not the shared ancestor it kept re-resolving:
+
+```lua
+-- shapes.lua — where `C1` is declared
+---@diagnostic disable-next-line: class-ancestry-too-costly
+---@class C1 : L1, R1
+```
+
+A directive in a file that merely *reads* `C1` does nothing, and this holds
+across files **under `luabox check`**: a class another project file declares
+is suppressed from *that* file. The editor does not honour the cross-file
+form — see the caveat under `luabox explain LB0317`.
+
+**The exception: a class declared only in a `[types] defs` package.** Nothing
+in the project declares it, and a definition package's own comments are never
+scanned for directives, so the diagnostic attaches to **line 1 of each
+consuming file** instead. Put a file-wide `---@diagnostic disable:
+class-ancestry-too-costly` at the top of that file, or a `disable-line` on
+line 1.
+";
+
+const LB0320: &str = "\
+# LB0320: `---@class` header with no usable class name
+
+A `---@class` line that does not name a class. Three spellings reach this:
+
+```lua
+---@class                  -- LB0320: nothing after the tag
+---@field x number
+
+---@class : Base           -- LB0320: a parent list where the name goes
+---@field x number
+
+---@class 123abc           -- LB0320: `123abc` is not an identifier
+---@field x number
+```
+
+**Why this is reported.** The header parses, so nothing fails loudly — and
+until this diagnostic existed, nothing was reported either. A header with no
+name declares no class at all: every `---@field` beneath it belongs to
+nothing, and the only signal anyone got was an unrelated-looking `LB0305
+unknown type name` at some later `---@type` referencing the name the class
+never received, arbitrarily far from the actual mistake. A header whose name
+is not an identifier is no better off — the class exists under a name no
+annotation can spell, so nothing can ever reference it. Either way, a
+machine-generated `---@class` block with a typo'd name produced a class that
+silently did not exist.
+
+**What to do.** Name the class. A class name is one or more dot-separated
+identifier segments — a letter, `_`, or non-ASCII character first, then
+letters, digits, `_` or non-ASCII:
+
+```lua
+---@class Point            -- fine
+---@class geometry.Point   -- fine: dotted namespaces are names too
+---@class _Private         -- fine
+---@class abc123           -- fine: digits are fine anywhere but first
+---@class (exact) Boxed<T> -- fine: `(exact)` and `<T>` are not part of the name
+---@class Derived : Base   -- the parent goes AFTER the name, not instead of it
+```
+
+**Parity with lua-language-server.** luals 3.13.5 reports
+`luadoc-miss-class-name` (\"`<class name> expected`\") at the declaration for
+all three shapes above — it treats a name token it cannot lex as an
+identifier exactly the way it treats a missing one — plus a
+`doc-field-no-class` on each orphaned `---@field` under the header. luabox
+reports the header once and leaves the fields alone: one mistake, one
+diagnostic.
+
+**A malformed *parent* is a different finding.** `---@class A : P,` names its
+class fine and has an empty slot in its extends list — that is LB0321, and
+`P` being undeclared is LB0305 on top. All three can fire on one line,
+because they are three different mistakes with three different fixes.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: luadoc-miss-class-name` suppresses
+it — luals' own rule name, so the directive you already write works unchanged.
+";
+
+const LB0321: &str = "\
+# LB0321: `---@class` extends list entry that is not a class name
+
+A `---@class` whose `: Parent` list has an entry the type parser cannot read
+as a name — a stray separator, or a token that is not a name at all:
+
+```lua
+---@class A : P,           -- LB0321: nothing after the comma
+---@class B : P,, Q        -- LB0321: nothing between the commas
+---@class C :              -- LB0321: nothing after the colon
+---@class D : ?            -- LB0321: `?` is not a class name
+```
+
+**Why this is reported.** The entry is ignored, so the class resolves with
+fewer parents than the line appears to give it — a parent silently dropped
+from an inheritance chain, which shows up much later as a missing field or
+method rather than as a syntax problem where the syntax problem is.
+
+**Why the message does not say the name is \"missing\".** All four shapes
+above arrive as one thing internally: the type parser's recovery node, which
+records that an entry could not be read but not *why*. Saying a name is
+missing would be right for the first three and wrong for the fourth, and this
+is an error under `[types] strict = true` — so the message says what holds for
+all of them.
+
+**What to do.** Drop the stray separator, or replace the entry with the
+parent it was meant to name:
+
+```lua
+---@class A : P            -- the comma was a typo
+---@class A : P, Q         -- the comma meant a second parent
+```
+
+**Not raised for a parent whose name reads.** `---@class A : Base<?>` keeps
+`Base` as a parent — it resolves, and its members are inherited — so the entry
+is a class name and this is not the finding, whatever the `<...>` contains.
+The rule stops at a name written on its own, and nowhere else: an entry that
+is a name *under* something — `Base?`, `Base[]`, `(Base)`, `Base|Base` — is
+not a parent either, and gives its class no members at all, the same as a
+union, a table literal, a `fun` type or no extends list. Anything but a bare
+name contributes no parent, so an unreadable token anywhere inside one is
+this finding — `---@class A : Base<?>[]` is reported, `---@class A : Base<?>`
+is not.
+
+**Distinct from LB0305 and LB0320.** `---@class A : P,` with `P` undeclared
+reports LB0305 (`unknown type name \\`P\\``) *as well*: one name is spelled
+correctly and declared nowhere, the other slot has no name at all. LB0320 is
+the class's own name being unusable, not a parent's. Each has its own fix.
+
+**Parity with lua-language-server.** luals 3.13.5 reports
+`luadoc-miss-class-extends-name` (\"`<class extends name> expected`\") at the
+comma, alongside its own `undefined-doc-class` on `P` — both findings, the
+same way luabox reports both.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: luadoc-miss-class-extends-name`
+suppresses it — luals' own rule name.
 ";
 
 const LB0500: &str = "\

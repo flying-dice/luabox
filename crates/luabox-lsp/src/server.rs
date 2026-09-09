@@ -29,11 +29,12 @@
 //!   closed stdin, a dead [`Connection`] — end the loop.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -43,6 +44,7 @@ use lsp_server::{
 use lsp_types::notification::{
     DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
     DidOpenTextDocument, Exit, LogMessage, Notification as _, Progress, PublishDiagnostics,
+    SetTrace,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -66,9 +68,10 @@ use lsp_types::{
     SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
     SignatureHelpOptions, SymbolInformation, TextDocumentContentChangeEvent,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    Uri, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams,
-    WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolResponse,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TraceValue,
+    TypeDefinitionProviderCapability, Uri, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
@@ -78,6 +81,7 @@ use luabox_types::{Ambient, RockModule, RockSurfaces, build_ambient};
 use rayon::prelude::*;
 
 use crate::line_index::LineIndex;
+use crate::merged_ambient::MergedAmbient;
 use crate::requires::RequireExports;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
@@ -217,6 +221,11 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
         .and_then(|w| w.did_change_watched_files.as_ref())
         .and_then(|d| d.dynamic_registration)
         .unwrap_or(false);
+    // The initial trace level (N22): `Off` unless the client explicitly asks
+    // for tracing, per spec ("If omitted trace is disabled ('off')") — the
+    // server's own diagnostic chatter (`Self::merged_ambient`'s rebuild log)
+    // is silent by default and stays silent for every client that never asks.
+    let trace = params.trace.unwrap_or_default();
 
     let root = root_path(&params)
         .or_else(|| std::env::current_dir().ok())
@@ -227,7 +236,7 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     // server from speaking *until it has responded to `initialize`*, and
     // `initialize_finish` above is that response. The bootstrap token below
     // has been sent from the same window since it shipped.
-    let mut server = Server::new(connection, root, work_done_progress);
+    let mut server = Server::new(connection, root, work_done_progress, trace);
     if watch_files {
         server.register_file_watchers();
     }
@@ -328,6 +337,16 @@ struct ProjectConfig {
     /// matches `luabox check`'s. Combined with the dialect stdlib into the
     /// server's [`Ambient`].
     def_sources: Vec<String>,
+    /// The absolute paths `def_sources`'s project-local entries were read
+    /// from (N18) — [`ambient_def_paths`], computed alongside `def_sources`
+    /// from the same resolution so the two can never disagree about what is
+    /// genuinely ambient.
+    def_paths: HashSet<PathBuf>,
+    /// The `---@alias`/`---@enum` names `def_sources` declares (round 8
+    /// review, F7) — [`merged_ambient::alias_or_enum_names`] over the very
+    /// same `Vec`, so the names and the layer built from those texts cannot
+    /// name different things.
+    def_alias_names: HashSet<String>,
     /// The `lua_modules/share/lua/<X.Y>/` version directory whose installed rock
     /// sources are harvested for their type surfaces (#30) — chosen by `[build]
     /// target` (the edition when unset), exactly as `luabox check` chooses it, so
@@ -350,6 +369,8 @@ impl ProjectConfig {
             strictness: Strictness::Warn,
             out_dir: None,
             def_sources: Vec::new(),
+            def_paths: HashSet::new(),
+            def_alias_names: HashSet::new(),
             rock_version_dir: luabox_bundle::rocks_version_dir(Dialect::Lua54),
             lint: LintConfig::new(),
             unknown_lint_rules: Vec::new(),
@@ -365,6 +386,11 @@ impl ProjectConfig {
         // shared with `luabox lint` — including the unknown-rule-id check the
         // manifest parser cannot do (CC-M8).
         let (lint, unknown_lint_rules) = LintConfig::from_manifest(&manifest.lint);
+        // One resolution, read twice (F7): the alias/enum names are harvested
+        // from the exact `Vec` the ambient layer is built from, not from a
+        // second walk that could resolve a different set of files.
+        let def_sources = ambient_def_sources(root, &manifest);
+        let def_alias_names = crate::merged_ambient::alias_or_enum_names(&def_sources);
         Self {
             // `Manifest::parse` types `[package] edition` as a closed
             // `DialectId`, so this maps inward exhaustively — there is no
@@ -372,7 +398,9 @@ impl ProjectConfig {
             dialect: syntax_dialect(manifest.package.edition),
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
-            def_sources: ambient_def_sources(root, &manifest),
+            def_sources,
+            def_alias_names,
+            def_paths: ambient_def_paths(root, &manifest),
             rock_version_dir: luabox_bundle::rocks_version_dir(syntax_dialect(
                 manifest.build.target,
             )),
@@ -416,6 +444,28 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
         .into_iter()
         .chain(layout::resolve_dep_defs(root, manifest))
         .map(|def| def.text)
+        .collect()
+}
+
+/// The absolute paths of the project's own `[types] defs` files (N18) — the
+/// genuine ambient scope [`crate::merged_ambient::MergedAmbient::ambient_paths`]
+/// backs [`crate::sema::locate_field`]'s elevated precedence with, so a
+/// `*.d.lua`-named file that is not actually configured here gets none.
+///
+/// Project-local only: [`layout::resolve_dep_defs`]'s files live under
+/// `lua_modules/<dep>/defs/` (`layout::VENDOR_DIR`), which
+/// [`layout::collect_lua_files`] always excludes from the ordinary source
+/// walk — they never appear in [`luabox_db::Analysis::files`] at all, so
+/// `locate_field` could never visit one regardless of what this returns.
+/// [`layout::resolve_project_defs`] labels a project-local def by its
+/// root-relative path (`defs/love.d.lua`) — the exact same walk `bootstrap`
+/// uses to populate the host, so a label here and a path in
+/// [`luabox_db::Analysis::files`] name the same file whenever both exist.
+fn ambient_def_paths(root: &Path, manifest: &Manifest) -> HashSet<PathBuf> {
+    let (project_defs, _unresolved) = layout::resolve_project_defs(root, &manifest.types.defs);
+    project_defs
+        .into_iter()
+        .map(|def| root.join(&def.label))
         .collect()
 }
 
@@ -532,6 +582,173 @@ fn harvest_rock_tree(root: &Path, version_dir: &str, ambient: &Ambient) -> RockS
     harvested
 }
 
+/// The bookkeeping behind cross-file diagnostics (round 8 review, F4).
+///
+/// # What it is for
+///
+/// Checking one file can produce a diagnostic whose primary span belongs to
+/// **another** — the `LB0317`/`LB0318` `---@class` ancestry pair points at
+/// the offending class's declaration, wherever it lives
+/// ([`diagnostics::FileDiagnostics`]). LSP has no way to say "add this one
+/// diagnostic to that document": `publishDiagnostics` **replaces** the whole
+/// set for a URI. So publishing a foreign group means publishing everything
+/// that document should show, which means knowing everything that document
+/// should show — and the code this replaces knew none of it. It published a
+/// foreign group and forgot it had, which produced four distinct failures
+/// with one root cause:
+///
+/// - **never cleared** — fix the cycle in the declaring file and the new pass
+///   produces no foreign group at all, so the loop that would have
+///   republished the other document never runs; its stale diagnostic stayed
+///   until that document was itself touched;
+/// - **vanished on a keystroke** — the group is produced by the *consuming*
+///   file's pass, so publishing the file it was painted onto replaced that
+///   file's set with its own half alone;
+/// - **last writer won** — two consumers each producing a group for one
+///   target: whichever published last replaced the other's finding;
+/// - **nondeterministic** — a batch republish walked a `HashMap`, so which of
+///   the two survived depended on hash order.
+///
+/// # The record
+///
+/// [`Self::contributions`] is the cross-file half: contributor → target →
+/// that pass's group. It is authoritative and total — a pass over a
+/// contributor **replaces** its whole entry, so a group that is no longer
+/// produced is a group that is no longer in the ledger, which is what makes
+/// clearing fall out rather than needing its own path.
+/// [`Self::own`] is each file's same-file half, as of the last pass over it,
+/// and prunes on the same rule (R11-4): both halves store only what a pass
+/// actually produced, so neither grows an entry per file in the workspace.
+/// A published set is then, for any target, that target's own half plus every
+/// contributor's group for it — with `BTreeMap` ordering throughout, so the
+/// merge is a function of the workspace and nothing else.
+#[derive(Default)]
+struct ForeignLedger {
+    /// Contributor path → (target path → the group that pass produced for
+    /// that target). A contributor with nothing to contribute has no entry:
+    /// [`Self::record`] removes it rather than storing an empty map, so
+    /// `contributions` never grows an entry per file in the workspace.
+    contributions: BTreeMap<PathBuf, BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
+    /// Path → the own half of the last pass over that file, i.e. exactly the
+    /// same-file diagnostics that file's URI is currently showing.
+    ///
+    /// Self-pruning on the same rule as [`Self::contributions`] (R11-4): a
+    /// pass that produces nothing removes the entry rather than storing an
+    /// empty vector. [`Self::published_set`] reads this map through
+    /// `unwrap_or_default`, so an absent entry and an empty one are the same
+    /// answer — and storing the empty one would grow `own` by an entry per
+    /// distinct file ever checked, never freed for the life of the session,
+    /// which is precisely the unbounded growth `contributions` avoids.
+    own: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    /// Path → the workspace-derived findings that belong to it, as of the
+    /// last pass that computed them — the declared-`---@class` cycle set
+    /// (`diagnostics::class_cycle_diagnostics`, round 12 review R12-1).
+    ///
+    /// **Not** per contributor, unlike [`Self::contributions`], and that is
+    /// the whole point. Every pass over any file derives the SAME answer for
+    /// the whole workspace, so filing it as a contribution would put one
+    /// cycle on a document once per file the session had ever checked, and
+    /// each of those copies would go stale on its own: fixing the file that
+    /// closed the loop clears the copy contributed by the pass that just ran
+    /// and leaves every other contributor's standing until they are
+    /// themselves re-checked. One authoritative map, replaced whole by each
+    /// pass that computes it, has neither problem — the same reason
+    /// `contributions` replaces a contributor's whole entry rather than
+    /// merging into it.
+    workspace: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+}
+
+/// Whether one completed pass derived the workspace-derived findings, and if
+/// so what they are.
+///
+/// An enum rather than [`ForeignLedger::record`]'s former `Option<map>`
+/// positional parameter (round 13 review, clean-code note). The two states
+/// are opposite instructions — "here is the whole workspace answer, replace
+/// yours" versus "I did not look, keep yours" — and `Option` spells the first
+/// one's *empty* case exactly like a mistake: a `Some(BTreeMap::new())`
+/// slipped in by a caller that had nothing to say would read as "the
+/// workspace has no cycles" and wipe every one of them off every document
+/// until the next pass anywhere put them back. Named variants make that
+/// call site say which it means.
+enum WorkspaceScan {
+    /// This pass derived the whole workspace answer. It **replaces** the
+    /// stored one, and the targets of both the old and the new are
+    /// republished — an empty map here is a real, measured "no cycles left".
+    Recomputed(BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>),
+    /// This pass derived nothing about the workspace; the stored answer
+    /// stands, and no document is republished on its account.
+    Skipped,
+}
+
+impl ForeignLedger {
+    /// Record one completed pass over `source` and answer with every path
+    /// whose published set may have moved, in sorted order.
+    ///
+    /// The affected set is the union of what `source` contributed *before*
+    /// this pass, what it contributes now, `source` itself, and — when this
+    /// pass recomputed one — the targets of the previous and the new
+    /// workspace answer. The "before" terms are what make a cleared
+    /// diagnostic clear: a target that has just dropped out is still
+    /// republished, now without it.
+    ///
+    /// `workspace` is [`WorkspaceScan::Skipped`] for a publish that did
+    /// **not** derive the workspace-derived findings — a path the analysis
+    /// does not know, which has no answer to give about anything. See that
+    /// type for why this is not an `Option`.
+    fn record(
+        &mut self,
+        source: &Path,
+        own: Vec<lsp_types::Diagnostic>,
+        foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+        workspace: WorkspaceScan,
+    ) -> Vec<PathBuf> {
+        let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
+        affected.insert(source.to_path_buf());
+        if let Some(previous) = self.contributions.get(source) {
+            affected.extend(previous.keys().cloned());
+        }
+        affected.extend(foreign.keys().cloned());
+        if let WorkspaceScan::Recomputed(workspace) = workspace {
+            affected.extend(self.workspace.keys().cloned());
+            affected.extend(workspace.keys().cloned());
+            self.workspace = workspace;
+        }
+
+        if foreign.is_empty() {
+            self.contributions.remove(source);
+        } else {
+            self.contributions.insert(source.to_path_buf(), foreign);
+        }
+        if own.is_empty() {
+            self.own.remove(source);
+        } else {
+            self.own.insert(source.to_path_buf(), own);
+        }
+        affected.into_iter().collect()
+    }
+
+    /// Everything `target`'s document should currently show: its own half,
+    /// then every contributor's group for it, contributors in path order.
+    ///
+    /// Every contributor is merged, not just the one that happens to be
+    /// publishing — two consumers reporting different findings against one
+    /// declaring file both appear, and neither erases the other.
+    ///
+    /// The workspace-derived half sits between the two: after the target's
+    /// own findings, before the per-contributor ones, and once — see
+    /// [`Self::workspace`].
+    fn published_set(&self, target: &Path) -> Vec<lsp_types::Diagnostic> {
+        let mut out = self.own.get(target).cloned().unwrap_or_default();
+        out.extend(self.workspace.get(target).into_iter().flatten().cloned());
+        for groups in self.contributions.values() {
+            if let Some(group) = groups.get(target) {
+                out.extend(group.iter().cloned());
+            }
+        }
+        out
+    }
+}
+
 /// The server state: the analysis host over the project's `.lua` files.
 struct Server {
     connection: Connection,
@@ -544,12 +761,65 @@ struct Server {
     /// dependency defs, #108), built once at startup so the editor's type
     /// resolution matches `luabox check`.
     ambient: Ambient,
+    /// The absolute paths of the project's own `[types] defs` files
+    /// [`Self::ambient`] was built from (N18) — [`ambient_def_paths`], kept
+    /// alongside `ambient` and installed into every [`MergedAmbient`] so
+    /// `sema::locate_field` can tell a genuinely ambient `.d.lua` file from
+    /// one that merely looks like one.
+    ambient_paths: HashSet<PathBuf>,
+    /// The `---@alias`/`---@enum` names [`Self::ambient`]'s definition
+    /// sources declare (round 8 review, F7) — project *and* dependency defs,
+    /// installed into every [`MergedAmbient`] so
+    /// `requires::require_struct_fields`'s gate can recognise a
+    /// dependency-declared alias the `analysis.files()` scan structurally
+    /// cannot see. Names only, not the source texts: a large definition
+    /// package is megabytes, and the gate asks only for a name.
+    ambient_alias_names: HashSet<String>,
     /// The type surfaces harvested from the project's vendored luarocks tree
     /// (#30), built once at startup alongside [`Self::ambient`]: rock classes,
     /// enums and aliases, plus each rock module's `require`-export type. Merged
     /// per file in [`crate::diagnostics`] — *after* the project's own types, so
     /// explicit beats implicit.
     rocks: RockSurfaces,
+    /// The merged editor ambient — [`Self::ambient`] + the workspace-global
+    /// project types + the rock tree — cached per
+    /// [`luabox_db::Analysis::revision`]. What this delivers, **measured**
+    /// (#57): every surface reading the SAME revision reuses one merge —
+    /// `code_actions` reusing the entry `publish_lua` installed for the same
+    /// request, and hover/completion/signature-help/goto-definition between
+    /// edits. What it does **not** deliver, also measured: diagnostics on a
+    /// keystroke. `DidChangeTextDocument` bumps the revision (`host.rs`)
+    /// immediately before `publish_lua` reads this cache, so the very next
+    /// read is guaranteed a miss — one full re-clone + re-merge per
+    /// keystroke, same as before this cache existed. A prior revision of
+    /// this comment claimed the keystroke case as a beneficiary; it was
+    /// not, and nothing had measured it.
+    ///
+    /// The revision key makes staleness structural: any [`Change`] bumps it,
+    /// and [`Self::reload_config`] — which swaps the base layers the merge
+    /// is built from without touching the host — clears the cache by hand
+    /// (see the comment there, and #59, for why that line is *not* dead
+    /// code despite [`Self::host`]'s revision bumping on the very next line
+    /// too).
+    ///
+    /// `RefCell` for the same reason as [`Self::pending`]: the read paths run
+    /// behind `&self`, and the server is single-threaded.
+    merged_ambient: RefCell<Option<(u64, Rc<MergedAmbient>)>>,
+    /// The declared-`---@class` cycle pass for the whole workspace, cached on
+    /// the host revision beside [`Self::merged_ambient`] and by the same
+    /// pattern (round 13 review, noted cost).
+    ///
+    /// Every publish derives the SAME answer from the same workspace — that
+    /// is the whole reason it lives in one ledger slot rather than per
+    /// contributor — so recomputing it inside every [`diagnostics::diagnostics`]
+    /// call meant re-collecting every `---@class` the project declares, and
+    /// re-running Tarjan over them, on every keystroke of every open buffer.
+    ///
+    /// Unlike the merge, this needs **no** manual invalidation: its only
+    /// inputs are the analysis and the strictness, and both move the host
+    /// revision ([`luabox_db::AnalysisHost::apply_change`]), so there is no
+    /// staleness the key cannot see.
+    class_cycles: RefCell<Option<(u64, Rc<diagnostics::ClassCycles>)>>,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -561,11 +831,31 @@ struct Server {
     /// The currently open documents (by path → URI), tracked from
     /// didOpen/didClose so a `workspace/didChangeConfiguration` can republish
     /// diagnostics for every open buffer after a settings change.
-    open_docs: HashMap<PathBuf, Uri>,
+    ///
+    /// A `BTreeMap`, not a `HashMap` (round 8 review, F4): a batch republish
+    /// walks this map and publishes as it goes, so hash order made *which*
+    /// document published last — and, before the ledger below, which
+    /// cross-file group survived — depend on nothing the workspace can see.
+    /// The same unchanged workspace emitted different diagnostics run to run.
+    open_docs: BTreeMap<PathBuf, Uri>,
+    /// Which file contributed which cross-file diagnostic to which other
+    /// file, and each file's own half — see [`ForeignLedger`].
+    foreign: ForeignLedger,
     /// Whether the client advertised `window.workDoneProgress`. Every
     /// `$/progress` the server sends is gated on this — a client that did not
     /// ask for progress receives none, on any path.
     progress: bool,
+    /// The client's negotiated trace level (`initialize`'s `trace` field,
+    /// `$/setTrace` afterwards) — `Off` unless a client opts in, per spec
+    /// default. Gates [`Self::merged_ambient`]'s "rebuilt@" log (N22): that
+    /// trace fired unconditionally on every cache miss, which a keystroke
+    /// guarantees (`Self::merged_ambient`'s own doc), so a client with no
+    /// interest in it — the overwhelming majority, since `trace` defaults to
+    /// `Off` and nothing else in this server asks a user to turn it on — used
+    /// to receive one `window/logMessage` per revision for the life of the
+    /// session regardless. `Cell` for the same reason `progress_seq` is: the
+    /// logging call sites run behind `&self`.
+    trace: Cell<TraceValue>,
     /// A monotonic counter making every server-created progress token — and
     /// the `window/workDoneProgress/create` request id that carries it —
     /// unique within the session.
@@ -695,7 +985,7 @@ const STARTUP_HARVEST_PROGRESS: (&str, &str) = ("luabox/rock-harvest", "Indexing
 const RELOAD_HARVEST_PROGRESS: (&str, &str) = ("luabox/reload", "Reloading luabox configuration");
 
 impl Server {
-    fn new(connection: Connection, root: PathBuf, progress: bool) -> Self {
+    fn new(connection: Connection, root: PathBuf, progress: bool, trace: TraceValue) -> Self {
         let config = ProjectConfig::discover(&root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
         let known_globals = ambient.global_names().clone();
@@ -712,11 +1002,17 @@ impl Server {
             strictness: config.strictness,
             out_dir: config.out_dir,
             ambient,
+            ambient_paths: config.def_paths,
+            ambient_alias_names: config.def_alias_names,
             rocks: RockSurfaces::default(),
+            merged_ambient: RefCell::new(None),
+            class_cycles: RefCell::new(None),
             lint: config.lint,
             known_globals,
-            open_docs: HashMap::new(),
+            open_docs: BTreeMap::new(),
+            foreign: ForeignLedger::default(),
             progress,
+            trace: Cell::new(trace),
             progress_seq: Cell::new(0),
             pending: RefCell::new(VecDeque::new()),
             create_unanswered: Cell::new(false),
@@ -815,14 +1111,32 @@ impl Server {
         // be resolved against.
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
+        self.ambient_paths = config.def_paths;
+        self.ambient_alias_names = config.def_alias_names;
         self.rocks = self.harvest_announced(config.rock_version_dir, RELOAD_HARVEST_PROGRESS);
+        // The merge's BASE layers just changed while the host (and so the
+        // revision) did not — the one staleness the revision key cannot see.
+        *self.merged_ambient.borrow_mut() = None;
         self.lint = config.lint;
         // Re-report: the reload may have introduced (or fixed) a typo'd key.
         self.log_lint_config_problems(&config.unknown_lint_rules);
+        // Guarded (#59): an unconditional `apply_change` here bumps the
+        // host's revision on every reload regardless of whether strictness
+        // actually moved, which pays for a full `clone_surface` +
+        // `merge_file_types` over every project file it never asked for —
+        // and, worse, makes the manual `merged_ambient` clear above
+        // untestable, since the bump alone would invalidate the cache and
+        // hide whether that line did anything. A reload that only touches
+        // `[types] defs` or the rock tree (this test's shape) now leaves the
+        // host's revision untouched, so the clear above is what is doing the
+        // work — and is the only thing that can be doing it.
+        let strictness_changed = config.strictness != self.strictness;
         self.strictness = config.strictness;
         self.out_dir = config.out_dir;
-        self.host
-            .apply_change(Change::SetStrictness(config.strictness));
+        if strictness_changed {
+            self.host
+                .apply_change(Change::SetStrictness(config.strictness));
+        }
         if config.dialect != self.dialect {
             self.dialect = config.dialect;
             let paths: Vec<PathBuf> = self
@@ -844,6 +1158,11 @@ impl Server {
     /// Republish diagnostics for every currently open document from a fresh
     /// snapshot — used after a configuration reload changes the cached
     /// strictness/lint/ambient so the visible diagnostics reflect it.
+    ///
+    /// In path order, because [`Self::open_docs`] is a `BTreeMap` (F4): each
+    /// iteration publishes as it goes, so the walk order is externally
+    /// observable, and hash order made an unchanged workspace produce
+    /// different batches run to run.
     fn republish_open_docs(&mut self) -> anyhow::Result<()> {
         for (path, uri) in self.open_docs.clone() {
             self.publish_lua(&uri, &path)?;
@@ -894,8 +1213,23 @@ impl Server {
         let token = self.begin_progress(files.len());
 
         for (i, path) in files.into_iter().enumerate() {
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                // Skipping is right — one unreadable file must not stop the
+                // index — but skipping *silently* is not: every cross-file
+                // answer this file would have contributed to is then wrong
+                // with no trace of why. `collect_lua_files` already reports
+                // its own failure; this is the per-file half of that rule.
+                Err(err) => {
+                    self.log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "workspace index: skipping unreadable file {}: {err}",
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
             };
             let name = path
                 .file_name()
@@ -1500,7 +1834,8 @@ impl Server {
     fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
         let (snapshot, sema, offset) = self.at(uri, position)?;
         let exports = self.require_exports(&snapshot, &sema.path);
-        hover::hover(&sema, offset, &exports)
+        let ambient = self.merged_ambient(&snapshot);
+        hover::hover(&sema, offset, &exports, &ambient, &snapshot)
     }
 
     /// The shared `require` resolution for one file — the same map the
@@ -1510,11 +1845,127 @@ impl Server {
         RequireExports::resolve(snapshot, path, &self.rocks)
     }
 
+    /// The merged ambient layer every editor surface reads — defs, then the
+    /// workspace-global project types, then the rock tree — so diagnostics,
+    /// hover, completion, signature help and goto-definition all resolve
+    /// against the very environment `luabox check` enforces (#56). Cached on
+    /// [`Analysis::revision`]: a request against an unchanged world reuses
+    /// the merge instead of re-cloning the defs surface and re-merging every
+    /// project file (see the field doc on [`Self::merged_ambient`] for what
+    /// this reuse does and does not reach, measured).
+    ///
+    /// Traced via [`Self::log_message`] at [`MessageType::LOG`] on the
+    /// **rebuild** arm only (#60, #58's `#[cfg(test)]`-only trace was proven
+    /// indistinguishable from a stale merge in a release build, R26 — that
+    /// requirement stands unchanged: a rebuild must stay externally
+    /// observable in a release build). R26 also logged the *hit* arm, on the
+    /// reasoning that clients filter `LOG` out of their visible pane by
+    /// default — an assumption about client behaviour the LSP spec does not
+    /// make, and several real clients surface every `window/logMessage` line
+    /// in an always-on output channel regardless of severity. A hit fires on
+    /// every hover, completion, signature-help, goto-definition and
+    /// diagnostics publish — once per request for the life of the session,
+    /// not once per revision — so logging it unconditionally is unbounded
+    /// chatter.
+    ///
+    /// **The rebuild arm is not rare either (N22).** The doc that shipped
+    /// with this trace argued "a rebuild happens once per revision, not once
+    /// per request, so volume collapses" — true in general, but every
+    /// `textDocument/didChange` bumps the revision (this function's own
+    /// paragraph above), so on the *editing* path "once per revision" is
+    /// "once per keystroke": measured, 100 edits produced 101 log messages.
+    /// The same "several real clients surface every `window/logMessage` line
+    /// in an always-on output channel" argument R26 used to drop the *hit*
+    /// arm applies unchanged to a rebuild log that fires that often.
+    ///
+    /// Gated on [`Self::trace`] (N22), not unconditional: `initialize`'s
+    /// `trace` field (spec default `Off`, updated live via `$/setTrace`) is
+    /// the protocol's own mechanism for exactly this kind of optional
+    /// execution trace — not a bespoke capability or config flag (the
+    /// alternative this doc used to reject "a negotiation path and a silent
+    /// default for a signal nobody asked to opt into" — `trace` already *is*
+    /// that negotiation, standardised, and a client that never sets it now
+    /// receives zero merged-ambient log lines, addressing the volume
+    /// complaint without touching R26's guarantee: a client that *does* ask
+    /// for `messages`/`verbose` sees a stale merge the same way it always
+    /// did — a missing `rebuilt@` line where an edit should have produced
+    /// one. What is lost, same as before: a client can no longer tell
+    /// "second read at this revision, cache hit" apart from "second read at
+    /// this revision, the server was never asked again" — both produce zero
+    /// additional log lines, and nothing downstream of this trace ever
+    /// needed that distinction (the cache-hit test below asserts the
+    /// *absence* of a second `rebuilt@`, not the presence of a `hit@`, for
+    /// exactly this reason). `revision` stays on the rebuild line so a
+    /// client's log pane can tell two rebuilds at different revisions apart
+    /// from a rebuild firing twice at the same one — a bug, since the cache
+    /// key is the revision.
+    ///
+    /// `LOG`, not `WARNING`/`INFO`: `WARNING`, used elsewhere in this file
+    /// (manifest problems, malformed messages), is for something the user
+    /// should notice unprompted; a cache rebuild is not that. `LOG` is the
+    /// tier LSP reserves for exactly this volume — clients that do filter it
+    /// stay silent, the same tier
+    /// [`luabox_db::AnalysisHost::take_execution_log`] answers for salsa's
+    /// own cache.
+    fn merged_ambient(&self, snapshot: &Analysis) -> Rc<MergedAmbient> {
+        let revision = snapshot.revision();
+        if let Some((cached_at, merged)) = self.merged_ambient.borrow().as_ref()
+            && *cached_at == revision
+        {
+            return Rc::clone(merged);
+        }
+        let merged = Rc::new(
+            MergedAmbient::build(&self.ambient, &snapshot.project_types(), self.rocks.types())
+                .with_ambient_paths(self.ambient_paths.clone())
+                .with_ambient_alias_names(self.ambient_alias_names.clone()),
+        );
+        // N22: gated on the negotiated trace level, not unconditional — see
+        // the `trace` field doc. A keystroke bumps the revision every time
+        // (this function's own doc), so an ungated log here is a
+        // `window/logMessage` per keystroke for the life of the session, for
+        // every client, with no way to turn it off; `trace` defaults to
+        // `Off`, so the overwhelming majority of sessions now see none of it,
+        // while a client that asks for `messages`/`verbose` still gets
+        // exactly the observability R26 established.
+        if self.trace.get() != TraceValue::Off {
+            self.log_message(
+                MessageType::LOG,
+                format!("merged ambient rebuilt@{revision}"),
+            );
+        }
+        *self.merged_ambient.borrow_mut() = Some((revision, Rc::clone(&merged)));
+        merged
+    }
+
+    /// The workspace's declared-`---@class` cycle pass at `snapshot`'s
+    /// revision, computed at most once per revision — see
+    /// [`Self::class_cycles`]' field doc.
+    ///
+    /// Deliberately unlogged, unlike [`Self::merged_ambient`]'s rebuild: that
+    /// log exists because the merge's cache key cannot see its own base
+    /// layers moving (N22/#59), and this one's can.
+    fn cycle_pass(&self, snapshot: &Analysis) -> Rc<diagnostics::ClassCycles> {
+        let revision = snapshot.revision();
+        if let Some((cached_at, cycles)) = self.class_cycles.borrow().as_ref()
+            && *cached_at == revision
+        {
+            return Rc::clone(cycles);
+        }
+        let cycles = Rc::new(diagnostics::class_cycle_diagnostics(
+            snapshot,
+            self.strictness,
+        ));
+        *self.class_cycles.borrow_mut() = Some((revision, Rc::clone(&cycles)));
+        cycles
+    }
+
     /// The callee's resolved signature(s) while `position` sits inside a
     /// call's argument list (see [`crate::signature_help`]).
     fn signature_help(&self, uri: &Uri, position: lsp_types::Position) -> Option<SignatureHelp> {
-        let (_snapshot, sema, offset) = self.at(uri, position)?;
-        signature_help::signature_help(&sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        let exports = self.require_exports(&snapshot, &sema.path);
+        let ambient = self.merged_ambient(&snapshot);
+        signature_help::signature_help(&sema, offset, &exports, &ambient, &snapshot)
     }
 
     /// The call-hierarchy item for the function the cursor names at `position`
@@ -1543,8 +1994,18 @@ impl Server {
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
-        let (_snapshot, sema, offset) = self.at(uri, position)?;
-        goto_definition::definition(&sema, offset, &self.root, self.dialect)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        let exports = self.require_exports(&snapshot, &sema.path);
+        let ambient = self.merged_ambient(&snapshot);
+        goto_definition::definition(
+            &sema,
+            offset,
+            &self.root,
+            self.dialect,
+            &snapshot,
+            &exports,
+            &ambient,
+        )
     }
 
     /// The declaration of the type carried by the value at `position`: its
@@ -1610,8 +2071,9 @@ impl Server {
     ) -> Option<Vec<lsp_types::CompletionItem>> {
         let (snapshot, sema, offset) = self.at(uri, position)?;
         let exports = self.require_exports(&snapshot, &sema.path);
+        let ambient = self.merged_ambient(&snapshot);
         Some(completion::completion(
-            &sema, offset, &snapshot, &self.root, &exports,
+            &sema, offset, &snapshot, &self.root, &exports, &ambient,
         ))
     }
 
@@ -1794,15 +2256,22 @@ impl Server {
         // context as `publish_lua`, so an `LB0302` offered on a quick-fix is
         // byte-identical to the published one) drive add-missing-field.
         let inferred = snapshot.binding_types(&sema.path);
+        let merged = self.merged_ambient(&snapshot);
+        let cycles = self.cycle_pass(&snapshot);
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
-            ambient: &self.ambient,
+            ambient: &merged,
             rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
+            cycles: &cycles,
         };
-        let type_diags =
-            diagnostics::diagnostics(&snapshot, &sema.path, self.dialect, &ctx).unwrap_or_default();
+        // `own` only: a quick fix is matched against ranges in *this*
+        // document, so a diagnostic whose span belongs to another file has
+        // nothing here to attach to (production readiness review, finding 4).
+        let type_diags = diagnostics::diagnostics(&snapshot, &sema.path, self.dialect, &ctx)
+            .map(|found| found.own)
+            .unwrap_or_default();
         actions.extend(code_action::code_actions(
             &sema,
             inferred.as_ref(),
@@ -1866,7 +2335,10 @@ impl Server {
                 let Some(path) = uri_to_path(&uri) else {
                     return Ok(());
                 };
-                let current = self.host.snapshot().file_text(&path).unwrap_or_default();
+                let Some(current) = self.base_text_for_change(&path, &params.content_changes)
+                else {
+                    return Ok(());
+                };
                 let text = apply_content_changes(current, params.content_changes);
                 self.set_text(&uri, text)?;
             }
@@ -1884,6 +2356,15 @@ impl Server {
                 // A settings change may alter dialect/strictness/lint/defs;
                 // re-read the manifest and republish every open document.
                 self.reload_config()?;
+            }
+            SetTrace::METHOD => {
+                // The client's live opt-in/opt-out of trace-level chatter
+                // (N22) — `initialize`'s `trace` field is only the starting
+                // value; `$/setTrace` is how a client turns tracing on
+                // mid-session (e.g. a "Report LSP issue" flow) or back off.
+                if let Some(params) = self.notification_params::<SetTrace>(not.params) {
+                    self.trace.set(params.value);
+                }
             }
             DidChangeWatchedFiles::METHOD => {
                 let Some(params) = self.notification_params::<DidChangeWatchedFiles>(not.params)
@@ -1912,15 +2393,29 @@ impl Server {
     /// Handle `workspace/didChangeWatchedFiles`: re-read each changed `.lua`
     /// file from disk into the host (so an external edit invalidates the
     /// analysis) and, if `luabox.toml` changed, reload the project config. A
-    /// deleted `.lua` file cannot be read, so its overlay/disk text is left as
-    /// is — a subsequent open will refresh it. Diagnostics for any changed file
-    /// that is currently open are republished; a manifest change republishes
-    /// every open document via [`Self::reload_config`].
+    /// deleted `.lua` file's text is cleared to empty rather than left as-is
+    /// (N24) — everything it exported or declared must stop resolving for
+    /// every other file that referenced it, which leaving the last-known
+    /// text in place would not do.
+    ///
+    /// Diagnostics for a changed file that is **not** shadowed by an editor
+    /// overlay are published for its own URI directly — an open buffer's
+    /// come from the overlay, so re-reading disk changes nothing visible
+    /// there. On top of that, any batch touching a `.lua` file at all —
+    /// created, changed or deleted — republishes every *open* document once,
+    /// after the loop, because the workspace surface those documents were
+    /// last checked against has moved. A manifest change republishes them
+    /// the same way via [`Self::reload_config`], which subsumes it.
+    ///
+    /// The sentence this replaces claimed the open files were the ones
+    /// republished and the others were not, which was the inverse of the
+    /// code on both counts (production readiness review, finding 2).
     fn watched_files_changed(
         &mut self,
         params: &DidChangeWatchedFilesParams,
     ) -> anyhow::Result<()> {
         let mut reload = false;
+        let mut republish_open = false;
         for event in &params.changes {
             let Some(path) = uri_to_path(&event.uri) else {
                 continue;
@@ -1933,6 +2428,54 @@ impl Server {
                 continue;
             }
             if event.typ == FileChangeType::DELETED {
+                // N24: the file is gone from disk, but the host still holds
+                // its last-known text (and everything derived from it —
+                // exports, class declarations) until told otherwise, so a
+                // stale `require` target keeps resolving and hover keeps
+                // answering from content that no longer exists. There is no
+                // `Change::RemoveFile` (`luabox_db::Change` has no delete
+                // variant) — clearing the text to empty is the closest
+                // in-repo equivalent: an empty file exports nothing and
+                // declares nothing, so every surface that read something out
+                // of it starts reading nothing, the same externally
+                // observable effect a real removal would have. Guarded by
+                // `open_docs` the same way the write-then-publish arm below
+                // is: an editor overlay still shadows disk, so a buffer left
+                // open after its backing file was deleted keeps showing what
+                // the user is looking at rather than being blanked out from
+                // under them.
+                self.host.apply_change(Change::SetFileText {
+                    path: path.clone(),
+                    dialect: self.dialect,
+                    text: String::new(),
+                });
+                if !self.open_docs.contains_key(&path) {
+                    self.publish_lua(&event.uri, &path)?;
+                }
+                // M58 (round 6 review): the deleted file's export/class
+                // surface just vanished from the merged workspace ambient —
+                // every already-*open* document whose diagnostics depended
+                // on it (a `require` of the deleted module, a class
+                // inherited from it, ...) must be re-checked against the
+                // new surface, the same way a manifest reload already
+                // re-checks every open document
+                // (`reload_config`/`republish_open_docs`). Resolution itself
+                // is correct the instant the change above lands (hover
+                // reads a fresh `Analysis` per request), but nothing
+                // re-published a *diagnostics* notification for anyone but
+                // the deleted file's own URI — an unrelated open consumer's
+                // Problems panel stayed clean until its own next keystroke
+                // re-triggered `set_text`'s publish, disagreeing with hover
+                // about the same instant in the meantime.
+                //
+                // Flagged, not called here: this arm runs once per deleted
+                // file in the batch, but `republish_open_docs` re-checks
+                // every open document from scratch (fresh `Analysis`,
+                // `publish_lua` per file) — calling it per event turns a
+                // batch of D deletes against O open documents into D×O full
+                // diagnostics passes. Set the flag and act once after the
+                // loop, same idiom as `reload`/`reload_config` below.
+                republish_open = true;
                 continue;
             }
             if let Ok(text) = fs::read_to_string(&path) {
@@ -1947,12 +2490,96 @@ impl Server {
                 if !self.open_docs.contains_key(&path) {
                     self.publish_lua(&event.uri, &path)?;
                 }
+                // The CREATED/CHANGED counterpart of M58's deleted-file
+                // republish (production readiness review, finding 2).
+                // Deletion is not the only event that moves the merged
+                // workspace ambient out from under an already-open consumer:
+                // a `git checkout` *restoring* a dependency, or an external
+                // edit adding the `---@field` an open buffer was being
+                // flagged for missing, arrives here as CREATED or CHANGED.
+                // The publish above covers the changed file's own URI and
+                // nothing else, so before this an open consumer kept a stale
+                // `LB0306` until its own next keystroke — M58's exact
+                // asymmetry, in the arm M58 did not touch.
+                //
+                // Flagged, acted on once after the loop, same idiom as the
+                // DELETED arm and `reload`: `republish_open_docs` re-checks
+                // every open document from scratch, so calling it per event
+                // turns a C-file batch against O open documents into C×O
+                // full diagnostics passes (H1).
+                republish_open = true;
             }
         }
         if reload {
+            // Subsumes `republish_open_docs` (see its call at the end of
+            // `reload_config`) — running both would publish every open
+            // document's diagnostics twice for a batch that both deletes a
+            // `.lua` file and touches `luabox.toml`.
             self.reload_config()?;
+        } else if republish_open {
+            self.republish_open_docs()?;
         }
         Ok(())
+    }
+
+    /// The text a `didChange` batch applies to, or `None` when the batch must
+    /// be dropped.
+    ///
+    /// `didChange` carries *edits*, not state (#78). A ranged change means
+    /// nothing without the buffer its range indexes into, and only an open
+    /// document has one: the client's ranges address the text it last synced,
+    /// which is the `didOpen` text plus every `didChange` since.
+    ///
+    /// "Does the host hold text?" is the wrong question to gate on.
+    /// `file_text` answers "overlay when set, disk otherwise", and
+    /// `bootstrap` indexes every `.lua` file under the root — so it says
+    /// `Some` for any indexed file, whose *disk* text no client ever agreed
+    /// to. Splicing a range into that, or into `""` as the
+    /// `unwrap_or_default()` this replaced did, invents a document: the
+    /// result becomes the overlay and gets diagnostics published for it,
+    /// painting the problems pane of a file the client never opened with
+    /// errors for code that exists in no buffer. For an indexed file it also
+    /// outlives the edit — the overlay shadows disk, and with no `didOpen`
+    /// there is no `didClose` to drop it.
+    ///
+    /// A batch whose *first* change is a full replace (`range: None`) needs no
+    /// base text: it supplies the whole document, and any later ranged edit in
+    /// the batch indexes into what that replace established. So the gate is on
+    /// the first change alone, not on "the batch contains a range": a batch is
+    /// accepted iff its first change is a full replace, and a batch that
+    /// begins ranged is dropped even if a later change in it is one — one
+    /// rule for an off-spec client, and a batch whose first change is already
+    /// ranged is a client that has already lost sync, not one to be trusted
+    /// to have found it again mid-batch.
+    fn base_text_for_change(
+        &self,
+        path: &Path,
+        changes: &[TextDocumentContentChangeEvent],
+    ) -> Option<String> {
+        if self.open_docs.contains_key(path)
+            && let Some(text) = self.host.snapshot().file_text(path)
+        {
+            return Some(text);
+        }
+        if changes.is_empty() {
+            // An empty batch has nothing to warn about: it is a legal no-op,
+            // not an edit with no base text, so it must stay silent.
+            return None;
+        }
+        if changes.first().is_some_and(|change| change.range.is_none()) {
+            return Some(String::new());
+        }
+        self.log_message(
+            MessageType::WARNING,
+            format!(
+                "ignoring `{}` for {}: the server holds no buffer for it (no \
+                 `textDocument/didOpen`), so an incremental edit has nothing \
+                 to apply to",
+                DidChangeTextDocument::METHOD,
+                path.display()
+            ),
+        );
+        None
     }
 
     /// didOpen/didChange: overlay the new text, then publish diagnostics.
@@ -1984,25 +2611,153 @@ impl Server {
                 .apply_change(Change::ClearOverlay { path: path.clone() });
             self.publish_lua(uri, &path)
         } else {
-            self.host.apply_change(Change::ClearOverlay { path });
-            self.publish(uri, Vec::new())
+            // A buffer with no disk backing: it stops contributing the
+            // instant it closes, so this goes through the ledger rather than
+            // publishing an empty set straight to the wire (F4). An untracked
+            // clear here would leave a cycle it had painted onto a real
+            // project file's panel with nothing left to ever remove it.
+            self.host
+                .apply_change(Change::ClearOverlay { path: path.clone() });
+            // And the workspace half is recomputed, not skipped (round 13
+            // review R13-A). The overlay that just went away was carrying
+            // this file's `---@class` declarations, so a cycle that only
+            // closed through them is now genuinely gone — but the cycle set
+            // is workspace-derived and lives in ONE ledger slot, so "not
+            // recomputed" left the last answer standing on every other
+            // member's document. Measured sequence: `a.lua` and
+            // `b.lua` declare a mutual cycle and are both open, `a.lua` is
+            // deleted on disk (the watched-DELETE arm blanks the disk text
+            // but the overlay still shadows it, so the cycle survives that
+            // pass), the user closes the orphaned tab — `read_to_string`
+            // fails, the overlay drops, and `b.lua` kept an `LB0318` naming
+            // a class nothing declares any more until it was itself touched.
+            // A false error on a clean open file, and the same "painted with
+            // nothing to remove it" class F4 closed for the other two slots.
+            //
+            // Recomputing is the honest answer, not a clear: it runs the
+            // same workspace pass over the post-`ClearOverlay` snapshot, so
+            // every cycle that survives this close survives in the ledger.
+            let workspace = self.workspace_findings();
+            self.publish_recorded(
+                uri,
+                &path,
+                Vec::new(),
+                BTreeMap::new(),
+                WorkspaceScan::Recomputed(workspace),
+            )
         }
+    }
+
+    /// The workspace-derived findings as of the current host state, with no
+    /// file in flight — [`diagnostics::workspace_diagnostics`] over a fresh
+    /// snapshot.
+    ///
+    /// Routes [`Self::cycle_pass`]' answer and nothing else, for the one
+    /// caller that must leave the ledger's workspace slot correct without
+    /// having a file to check ([`Self::close`]). The `ClearOverlay` that
+    /// precedes it has just moved the revision, so this genuinely derives a
+    /// new pass rather than reusing the cached one — which is the point.
+    fn workspace_findings(&self) -> BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>> {
+        let analysis: Analysis = self.host.snapshot();
+        let cycles = self.cycle_pass(&analysis);
+        diagnostics::workspace_diagnostics(&analysis, &cycles)
     }
 
     /// Publish the current diagnostics for one `.lua` file from a fresh
     /// snapshot.
+    ///
+    /// Checking one file can produce a diagnostic that belongs to **another**
+    /// — the cross-file `---@class` ancestry pair `LB0317`/`LB0318` points at
+    /// the offending class's declaration, wherever that lives
+    /// ([`diagnostics::FileDiagnostics`]). Each such group is published under
+    /// its own document URI, at its own file's line numbers, rather than
+    /// rendered inside this document at an offset its text cannot carry
+    /// (production readiness review, finding 4).
+    ///
+    /// A `publishDiagnostics` notification *replaces* the whole set for its
+    /// URI, so every publish here goes through [`ForeignLedger`], which is
+    /// the record of what each document should be showing — see its doc for
+    /// the four failures the un-recorded version produced.
+    ///
+    /// # Exactly one diagnostics pass per publish (round 8 review, F19)
+    ///
+    /// There is one `diagnostics::diagnostics` call in this function and it
+    /// is not in a loop, so a publish costs one whole-file pass (parse +
+    /// validate + type-check + lint) no matter how many URIs it ends up
+    /// notifying. The version this replaces ran a **further** full pass per
+    /// foreign target, per publish — i.e. per keystroke, single-threaded, no
+    /// debounce — purely to recover that target's own half, which the ledger
+    /// now already holds.
+    ///
+    /// What that costs, stated rather than hidden: a target's own half is the
+    /// one from the last pass over *that* file, so a document nobody has
+    /// opened shows the cross-file group alone until it is itself checked
+    /// (opening it, editing it, or a watched-file event for it — each of
+    /// which publishes it in full and merges the groups back in). That is
+    /// strictly what the client is already displaying for that URI plus the
+    /// group being added: re-stating a file's own half from the ledger can
+    /// never contradict the panel, because the ledger *is* what was put in
+    /// the panel. The alternative — re-deriving every foreign target's whole
+    /// file on every keystroke of every open buffer — is the O(open ×
+    /// foreign) stall F19 measures, paid to refresh diagnostics for
+    /// documents the user never asked about.
     fn publish_lua(&mut self, uri: &Uri, path: &Path) -> anyhow::Result<()> {
         let analysis: Analysis = self.host.snapshot();
-        let ctx = diagnostics::CheckCtx {
-            strictness: self.strictness,
-            ambient: &self.ambient,
-            rocks: &self.rocks,
-            lint: &self.lint,
-            known_globals: &self.known_globals,
+        let found = {
+            let merged = self.merged_ambient(&analysis);
+            let cycles = self.cycle_pass(&analysis);
+            let ctx = diagnostics::CheckCtx {
+                strictness: self.strictness,
+                ambient: &merged,
+                rocks: &self.rocks,
+                lint: &self.lint,
+                known_globals: &self.known_globals,
+                cycles: &cycles,
+            };
+            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx)
         };
-        let diags =
-            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
-        self.publish(uri, diags)
+        // No pass at all (a path the analysis does not know) publishes an
+        // empty own half — but must NOT publish an empty *workspace* half:
+        // that map is the whole answer, not this file's share of it, and a
+        // default-constructed one would read as "the workspace has no
+        // cycles" and wipe every one of them off every document. That is
+        // what `WorkspaceScan::Skipped` says, in the one place it is true.
+        let (own, foreign, workspace) = match found {
+            Some(found) => (
+                found.own,
+                found.foreign,
+                WorkspaceScan::Recomputed(found.workspace),
+            ),
+            None => (Vec::new(), BTreeMap::new(), WorkspaceScan::Skipped),
+        };
+        self.publish_recorded(uri, path, own, foreign, workspace)
+    }
+
+    /// Fold one pass's result into the ledger and publish every document it
+    /// moved — the checked file itself included, and in sorted path order so
+    /// a batch is reproducible.
+    ///
+    /// `uri` is used verbatim for `path`'s own notification rather than
+    /// re-derived, so a document keeps the exact URI spelling its client
+    /// opened it under; the other affected paths have no client-supplied URI
+    /// to preserve.
+    fn publish_recorded(
+        &mut self,
+        uri: &Uri,
+        path: &Path,
+        own: Vec<lsp_types::Diagnostic>,
+        foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+        workspace: WorkspaceScan,
+    ) -> anyhow::Result<()> {
+        for target in self.foreign.record(path, own, foreign, workspace) {
+            let set = self.foreign.published_set(&target);
+            if target == path {
+                self.publish(uri, set)?;
+            } else {
+                self.publish(&crate::uri::path_to_uri(&target), set)?;
+            }
+        }
+        Ok(())
     }
 
     fn publish(&self, uri: &Uri, diagnostics: Vec<lsp_types::Diagnostic>) -> anyhow::Result<()> {
@@ -2118,21 +2873,27 @@ fn workspace_symbol_key(info: &SymbolInformation) -> (String, String, u32, u32, 
     reason = "test code — panics document assumptions"
 )]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
 
     use lsp_server::{Connection, Message, Notification, Request, RequestId};
-    use lsp_types::notification::{DidOpenTextDocument, Notification as _};
+    use lsp_types::notification::{
+        DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+        DidOpenTextDocument, Notification as _,
+    };
     use lsp_types::request::{HoverRequest, Request as _};
-    use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+    use lsp_types::{MessageType, Position, Range, TextDocumentContentChangeEvent, TraceValue};
     use luabox_lint::LintConfig;
     use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    use std::collections::BTreeMap;
+
     use super::{
-        CodeActionOrCommand, ErrorCode, ProjectConfig, PublishDiagnostics, Server,
-        ambient_def_sources, apply_content_changes, root_path,
+        CodeActionOrCommand, ErrorCode, ForeignLedger, ProjectConfig, PublishDiagnostics, Rc,
+        Server, WorkspaceScan, ambient_def_sources, apply_content_changes, root_path,
     };
 
     /// A ranged change replacing `[start, end)` with `text`.
@@ -2519,6 +3280,1646 @@ mod tests {
         assert!(ambient_def_sources(dir.path(), &manifest).is_empty());
     }
 
+    // === Merged ambient cache (#57–#60) ====================================
+    //
+    // What the cache measurably delivers (#57, correcting the prior comment's
+    // false "diagnostics on each keystroke" claim): the SAME revision's
+    // second read reuses the merge — read here through the *absence* of a
+    // second `rebuilt@` `window/logMessage` line (#58/#60's observability,
+    // made real in a release build by R26 — no `#[cfg(test)]` gate, so
+    // `merged_ambient_log` reads the protocol the server actually sent, not
+    // an in-process vec only tests can see), not by inference from timing or
+    // a deleted cache still passing the suite green. R26 also logged the hit
+    // arm directly as a `hit@` line; a later pass (finding 1, volume flagged
+    // independently by three review passes) dropped it — a hit fires once
+    // per request for the life of a session, unconditionally, and several
+    // real `window/logMessage` panes surface every line regardless of
+    // severity. `merged_ambient`'s own doc carries the full trade; what's
+    // pinned here is what survives it.
+
+    /// The `merged ambient rebuilt@` `window/logMessage` payloads among
+    /// `messages`, in order — the same signal [`super::Server::merged_ambient`]
+    /// sends a real client, so a test reading it is reading exactly what
+    /// production would log, not a parallel test-only channel (R26). No
+    /// `hit@` payload exists to read (finding 1: the hit arm is not logged),
+    /// so this list is exactly the server's rebuild history at this
+    /// revision-key granularity.
+    fn merged_ambient_log(messages: &[Message]) -> Vec<String> {
+        log_messages(messages)
+            .into_iter()
+            .filter(|m| m.starts_with("merged ambient "))
+            .collect()
+    }
+
+    /// Open one document and hover it twice with no edit in between: the
+    /// `didOpen` publish is the first read at this revision (a rebuild), the
+    /// hover right after is the second. Only the rebuild arm is logged
+    /// (finding 1), so the cross-surface reuse the cache actually delivers
+    /// shows up as the *absence* of a second `rebuilt@` line, not a `hit@`
+    /// one — the only way the wire now exposes it.
+    #[test]
+    fn a_second_read_at_the_same_revision_does_not_rebuild_again() {
+        let (dir, mut server, client) = test_server_with_trace(TraceValue::Messages);
+        let path = dir.path().join("main.lua");
+        let source = "local x = 1\nprint(x)\n";
+        fs::write(&path, source).expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        // The `didOpen` publish is itself a read at this revision (the
+        // rebuild) — captured, not discarded, since the log is now the real
+        // `window/logMessage` protocol and a dropped drain is a dropped
+        // message, not just a cleared in-process buffer (R26).
+        let mut trace = merged_ambient_log(&drain(&client));
+
+        server.hover(&uri, lsp_types::Position::new(1, 6));
+        trace.extend(merged_ambient_log(&drain(&client)));
+
+        assert_eq!(
+            trace.iter().filter(|e| e.contains("rebuilt@")).count(),
+            1,
+            "a second read at the same revision must reuse the merge, not \
+             rebuild it again: {trace:?}"
+        );
+    }
+
+    /// N22: a client that never sets `trace` (the spec default, and what
+    /// `test_server`/`test_server_with` build) sees **no** "merged ambient
+    /// rebuilt@" chatter at all, even across several edits that each
+    /// guarantee a rebuild — the volume complaint's fix, measured the same
+    /// way the complaint itself was: counting `window/logMessage` traffic
+    /// across a run of edits.
+    #[test]
+    fn a_client_that_never_sets_trace_receives_no_merged_ambient_log() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "local x = 1\n").expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local x = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let mut trace = merged_ambient_log(&drain(&client));
+        for version in 2..=4 {
+            server
+                .handle_notification(Notification {
+                    method: DidChangeTextDocument::METHOD.to_string(),
+                    params: json!({
+                        "textDocument": { "uri": uri.to_string(), "version": version },
+                        "contentChanges": [{ "text": format!("local x = {version}\n") }],
+                    }),
+                })
+                .expect("didChange");
+            trace.extend(merged_ambient_log(&drain(&client)));
+        }
+        assert!(trace.is_empty(), "{trace:?}");
+    }
+
+    /// N22: `$/setTrace` turns the log on mid-session — a client is not
+    /// limited to whatever `initialize`'s `trace` field said at startup.
+    #[test]
+    fn a_set_trace_notification_turns_the_merged_ambient_log_on_live() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "local x = 1\n").expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local x = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        // Silent before the client asks for tracing.
+        assert!(merged_ambient_log(&drain(&client)).is_empty());
+
+        server
+            .handle_notification(Notification {
+                method: "$/setTrace".to_string(),
+                params: json!({ "value": "messages" }),
+            })
+            .expect("setTrace");
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local x = 2\n" }],
+                }),
+            })
+            .expect("didChange");
+        let trace = merged_ambient_log(&drain(&client));
+        assert_eq!(
+            trace.iter().filter(|e| e.contains("rebuilt@")).count(),
+            1,
+            "{trace:?}"
+        );
+    }
+
+    /// A keystroke bumps the revision (`host.rs`) immediately before
+    /// `publish_lua` reads this cache, so the very next read is a guaranteed
+    /// miss — measured, not assumed: two edits in a row rebuild twice, never
+    /// reuse a merge from before either edit.
+    #[test]
+    fn a_keystroke_always_rebuilds_never_hits() {
+        let (dir, mut server, client) = test_server_with_trace(TraceValue::Messages);
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "local x = 1\n").expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local x = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+
+        // Each `didChange` republishes diagnostics, which reads the cache
+        // (`publish_lua` → `merged_ambient`) — the drain must happen inside
+        // the loop, per iteration, or the `window/logMessage` for an earlier
+        // change is indistinguishable from a later one once both are mixed
+        // into one drain. Each edit's text must genuinely differ from the
+        // last (round 4 review R17): `apply_change` now bumps the revision
+        // only when a salsa input actually changed, so two edits setting
+        // the identical text would make the second a no-op — a legitimate
+        // cache *hit* — and this test would stop measuring what its name
+        // claims.
+        let mut trace = Vec::new();
+        for version in 2..=3 {
+            server
+                .handle_notification(Notification {
+                    method: DidChangeTextDocument::METHOD.to_string(),
+                    params: json!({
+                        "textDocument": { "uri": uri.to_string(), "version": version },
+                        "contentChanges": [{ "text": format!("local x = {version}\n") }],
+                    }),
+                })
+                .expect("didChange");
+            trace.extend(merged_ambient_log(&drain(&client)));
+        }
+
+        // Only the rebuild arm is logged (finding 1) — a `hit@` line cannot
+        // appear even if a bug turned one of these into an accidental cache
+        // hit, so the assertion the test's name stands on is the rebuild
+        // count alone: two edits in, two rebuilds out, none skipped.
+        assert_eq!(
+            trace.iter().filter(|e| e.contains("rebuilt@")).count(),
+            2,
+            "{trace:?}"
+        );
+    }
+
+    /// #59: a reload that changes only `[types] defs` (no strictness change)
+    /// still invalidates the merged-ambient cache, because the manual clear
+    /// in `reload_config` does not depend on the host's revision moving —
+    /// and, per the guard added there, the revision genuinely does not move
+    /// in this scenario (`SetStrictness` is skipped when the value is
+    /// unchanged), so this is the manual clear's effect in isolation, not
+    /// the revision key's.
+    #[test]
+    fn a_defs_only_reload_invalidates_the_cache_without_bumping_the_revision() {
+        let (dir, mut server, client) = test_server_with_trace(TraceValue::Messages);
+        let root = dir.path();
+        fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.gadget)\n";
+        fs::write(&path, source).expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+        let before = server.host.snapshot().revision();
+
+        // Add a `[types] defs` entry declaring `Widget` and reload — no
+        // strictness change. Def files resolve under `<root>/defs/<name>.d.lua`
+        // (`layout::resolve_project_defs`), so `defs = ["widget"]`.
+        fs::create_dir_all(root.join("defs")).expect("defs dir");
+        fs::write(
+            root.join("defs/widget.d.lua"),
+            "---@meta\n---@class Widget\n---@field gadget number\n",
+        )
+        .expect("write defs");
+        fs::write(
+            root.join("luabox.toml"),
+            format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"widget\"]\n"),
+        )
+        .expect("rewrite manifest");
+        server.reload_config().expect("reload");
+        drop(drain(&client));
+
+        let after = server.host.snapshot().revision();
+        assert_eq!(
+            before, after,
+            "strictness did not change, so neither should the revision"
+        );
+
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 10));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        assert!(text.contains("Widget.gadget"), "{text}");
+    }
+
+    /// Round 4 review R11: a `[types] defs` declaration of `Widget` collides
+    /// with an ordinary project file's own `---@class Widget`. The type
+    /// merge (`env.rs`'s `merge_file_types`) seeds the ambient/defs classes
+    /// first, so a same-named field on a later-merged project file loses the
+    /// *type* collision but not its own `---@field` description — hover must
+    /// render the defs field's type with whichever file's description
+    /// `locate_field` actually names (here, the same defs file, since it is
+    /// visited first), and goto-definition must jump there too, not to the
+    /// project file `sema::locate_field` used to prefer by alphabetical
+    /// accident.
+    #[test]
+    fn a_defs_declaration_wins_a_same_name_collision_over_a_project_files_own() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::create_dir_all(root.join("defs")).expect("defs dir");
+        fs::write(
+            root.join("defs/widget.d.lua"),
+            "---@meta\n---@class Widget\n---@field id string the id from defs\n",
+        )
+        .expect("write defs");
+        // An unrelated project file re-declaring the identical class name
+        // with a *different* field type and its own description — the
+        // collision. Named so it would sort before `defs/widget.d.lua`
+        // alphabetically, the exact ordering the previous `sort_unstable()`
+        // used and got wrong.
+        fs::write(
+            root.join("a_widget.lua"),
+            "---@class Widget\n---@field id number the id from a_widget\n",
+        )
+        .expect("write the colliding project file");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.id)\n";
+        fs::write(&path, source).expect("write the document");
+        fs::write(
+            root.join("luabox.toml"),
+            format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"widget\"]\n"),
+        )
+        .expect("write manifest");
+        // `reload_config` picks up `[types] defs` (the ambient/base layer,
+        // read straight off disk); `bootstrap` is what actually loads every
+        // `.lua` file — `defs/widget.d.lua` included (`DefFiles::Include`)
+        // — into the host as a *project* file too, which is what
+        // `sema::locate_field`'s cross-file search reads. Both are needed:
+        // without `bootstrap`, neither colliding declaration is visible to
+        // `locate_field` at all, and the test would pass vacuously with an
+        // empty description on either side of the assertion.
+        server.reload_config().expect("reload");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&path);
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        // The type is defs' (`string`), not the project file's (`number`).
+        assert!(text.contains("Widget.id: string"), "{text}");
+        assert!(!text.contains("Widget.id: number"), "{text}");
+        // The description is whichever file `locate_field` actually named —
+        // the defs file, since it is visited first — not the project file's.
+        assert!(text.contains("the id from defs"), "{text}");
+        assert!(!text.contains("the id from a_widget"), "{text}");
+
+        // Goto-definition follows the same authority: it must land in the
+        // defs file, not the project file whose type lost the collision.
+        let location = server
+            .definition(&uri, lsp_types::Position::new(2, 8))
+            .expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("defs/widget.d.lua"),
+            "{location:?}"
+        );
+    }
+
+    /// Finding 3: two *ordinary* project files (neither one is `current`,
+    /// neither is a `.d.lua`) both declare `---@class Widget`. `sema.rs`'s
+    /// `search_order` broke this tie with an alphabetical sort, documented
+    /// as "not proven to match `merge_file_types`'s own first-wins order,
+    /// which is keyed on `Project::files(db)` insertion order". This pins
+    /// that it *does* match, for the file set every real session's `current`
+    /// actually collides against — every file `bootstrap` loads at startup:
+    /// `Project::files(db)`'s insertion order is exactly
+    /// `luabox_manifest::layout::collect_lua_files`'s walk order (sorted by
+    /// filename within each directory, always descending fully before the
+    /// next sibling), which is the same order `Path`'s own component-wise
+    /// `Ord` produces over the full paths — i.e. exactly what
+    /// `rest.sort_unstable()` in `search_order` produces. `aa_widget.lua`
+    /// sorts before `bb_widget.lua` both ways, so if the ordering actually
+    /// disagreed with the merge, this test would show the *type* resolving
+    /// to one file while hover's *description* and goto-definition named
+    /// the other — the exact split finding 3 warns is possible.
+    #[test]
+    fn a_first_declared_ordinary_project_file_wins_a_same_name_collision_over_a_later_one() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
+        fs::write(
+            root.join("aa_widget.lua"),
+            "---@class Widget\n---@field id string the id from aa_widget\n",
+        )
+        .expect("write the first-sorted colliding file");
+        fs::write(
+            root.join("bb_widget.lua"),
+            "---@class Widget\n---@field id number the id from bb_widget\n",
+        )
+        .expect("write the second-sorted colliding file");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.id)\n";
+        fs::write(&path, source).expect("write the document");
+        // `bootstrap`, not `didOpen`, so `Project::files(db)` receives every
+        // file in `collect_lua_files`'s sorted walk order — the order the
+        // proof above depends on. `didOpen`-only files append in open order
+        // instead (the gap `sema::locate_field`'s doc names as still open).
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&path);
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        // The type merge's own first-wins decision.
+        assert!(text.contains("Widget.id: string"), "{text}");
+        assert!(!text.contains("Widget.id: number"), "{text}");
+        // Navigation must agree with it — same file, same description.
+        assert!(text.contains("the id from aa_widget"), "{text}");
+        assert!(!text.contains("the id from bb_widget"), "{text}");
+
+        let location = server
+            .definition(&uri, lsp_types::Position::new(2, 8))
+            .expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("aa_widget.lua"),
+            "{location:?}"
+        );
+    }
+
+    /// N18: a `.d.lua`-named file is not automatically part of the project's
+    /// *ambient* defs scope — that requires `[types] defs = [...]` naming it
+    /// (`sema::locate_field`'s doc used to claim otherwise). With no such
+    /// config, `defs/widget.d.lua` here is just an ordinary project file that
+    /// happens to be named by convention, and `merge_file_types` (`env.rs`)
+    /// has no notion of the `.d.lua` suffix at all for ordinary project
+    /// files — collision resolution is pure first-loaded-wins, the same as
+    /// the plain-file case pinned above. Before the fix, `sema::search_order`
+    /// unconditionally visited every `*.d.lua` file ahead of `current` and
+    /// every other project file, so the *type* resolved to `a_widget.lua`
+    /// (the type merge's real answer, matching `luabox check`) while hover's
+    /// *description* and goto-definition both named `defs/widget.d.lua`
+    /// instead — three surfaces giving three different answers about which
+    /// declaration won, off one cursor position.
+    #[test]
+    fn a_def_named_file_with_no_types_defs_config_is_an_ordinary_project_file_for_collisions() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
+        fs::write(
+            root.join("a_widget.lua"),
+            "---@class Widget\n---@field id string the id from a_widget\n",
+        )
+        .expect("write the first-sorted colliding file");
+        fs::create_dir_all(root.join("defs")).expect("mkdir defs");
+        fs::write(
+            root.join("defs/widget.d.lua"),
+            "---@meta\n---@class Widget\n---@field id number the id from defs\n",
+        )
+        .expect("write the second-sorted colliding file");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.id)\n";
+        fs::write(&path, source).expect("write the document");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&path);
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        // The type merge's own first-wins decision: `a_widget.lua` sorts
+        // before `defs/widget.d.lua` (`a` < `defs`'s `d`), so it is loaded
+        // first and wins the collision — exactly as the plain two-`.lua`-file
+        // case above does, `.d.lua` naming notwithstanding.
+        assert!(text.contains("Widget.id: string"), "{text}");
+        assert!(!text.contains("Widget.id: number"), "{text}");
+        // Description must agree with the type, not the other declaration.
+        assert!(text.contains("the id from a_widget"), "{text}");
+        assert!(!text.contains("the id from defs"), "{text}");
+
+        let location = server
+            .definition(&uri, lsp_types::Position::new(2, 8))
+            .expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("a_widget.lua"),
+            "{location:?}"
+        );
+    }
+
+    // === Watched-file deletion (N24) =======================================
+
+    /// N24: a `require` target deleted mid-session must stop resolving.
+    /// `watched_files_changed`'s `FileChangeType::DELETED` arm used to
+    /// `continue` outright, never telling the host anything changed — the
+    /// host kept the deleted file's last-known text (and everything derived
+    /// from it) indefinitely, so hover kept answering from a file that no
+    /// longer exists on disk. There is no `Change::RemoveFile` in
+    /// `luabox-db` (`luabox_db::Change` has `SetFileText`/`SetOverlay`/
+    /// `ClearOverlay`/`SetDialect`/`SetStrictness`, no delete variant) —
+    /// overwriting the text to empty is the closest in-repo equivalent: an
+    /// empty file exports nothing and declares nothing, so every surface
+    /// that read something out of it starts reading nothing, the same
+    /// externally-observable effect a real removal would have.
+    #[test]
+    fn a_deleted_require_target_stops_resolving() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let point_path = root.join("point.lua");
+        fs::write(
+            &point_path,
+            "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+        )
+        .expect("write point.lua");
+        let main_path = root.join("main.lua");
+        let source = "local p = require(\"point\")\nprint(p.x)\n";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&main_path);
+        let before = server.hover(&uri, lsp_types::Position::new(1, 8));
+        let text_before = match before.expect("hover before deletion").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        assert!(text_before.contains("Point.x"), "{text_before}");
+
+        // The file is gone from disk — deleting it for real, then telling
+        // the server via `workspace/didChangeWatchedFiles`, exactly as a
+        // client with file watching enabled would.
+        fs::remove_file(&point_path).expect("delete point.lua");
+        let point_uri = crate::uri::path_to_uri(&point_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": point_uri.to_string(), "type": 3 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        drop(drain(&client));
+
+        let after = server.hover(&uri, lsp_types::Position::new(1, 8));
+        let text_after = after.map(|h| match h.contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        });
+        assert!(
+            text_after.as_deref().is_none_or(|t| !t.contains("Point.x")),
+            "a deleted require target must stop resolving: {text_after:?}"
+        );
+    }
+
+    /// The one-variable control: a *non*-deleted watched-file change (a
+    /// `Changed`/`Created` event) must still update resolution the way it
+    /// always has — the deletion arm's fix must not have broken the other
+    /// branch of the same handler.
+    #[test]
+    fn a_changed_require_targets_watched_file_event_still_updates_resolution() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let point_path = root.join("point.lua");
+        fs::write(
+            &point_path,
+            "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+        )
+        .expect("write point.lua");
+        let main_path = root.join("main.lua");
+        let source = "local p = require(\"point\")\nprint(p.x)\n";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        // An external edit, not through the editor overlay — adds a field.
+        fs::write(
+            &point_path,
+            "---@class Point\n---@field x number\n---@field y number\nlocal P = {}\nreturn P\n",
+        )
+        .expect("rewrite point.lua");
+        let point_uri = crate::uri::path_to_uri(&point_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": point_uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        drop(drain(&client));
+
+        let main_uri = crate::uri::path_to_uri(&main_path);
+        let hover = server.hover(&main_uri, lsp_types::Position::new(1, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        assert!(text.contains("Point.x"), "{text}");
+    }
+
+    /// M58 (round 6 review, N24 half-fixed): resolution is correct
+    /// immediately after a `DELETED` watched-file event — hover for the
+    /// deleted class's own file already answers `null` right away, proven
+    /// above. What was still missing: the event alone republished nothing
+    /// for an *unrelated* already-open document whose diagnostics depended
+    /// on the deleted file (a class inherited from it, here) — its Problems
+    /// panel stayed clean until its own next keystroke, disagreeing with
+    /// hover about the same instant. `base.lua` is deleted; `main.lua`
+    /// (open, inheriting from `Base`) must be republished with the
+    /// resulting diagnostic in the same batch, not on the next edit.
+    #[test]
+    fn a_deleted_watched_file_republishes_diagnostics_for_an_open_consumer() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let base_path = root.join("base.lua");
+        fs::write(&base_path, "---@class Base\n---@field id number\n").expect("write base.lua");
+        let main_path = root.join("main.lua");
+        // A `---@param`, not a `---@type … = nil` binding: the latter is
+        // itself an `LB0300` (`nil` does not satisfy `Sub`) so it is never
+        // clean, and this test's whole subject is the transition from clean
+        // to not-clean caused by the deletion alone.
+        let source = "\
+---@class Sub : Base
+
+---@param s Sub
+local function use(s) print(s.id) end
+
+return use
+";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let main_uri = crate::uri::path_to_uri(&main_path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": main_uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let opened = drain(&client);
+        let before = published_diagnostics(&opened, &main_uri)
+            .expect("didOpen publishes main.lua's diagnostics");
+        assert!(
+            before.as_array().is_some_and(Vec::is_empty),
+            "clean before the deletion: {before:?}"
+        );
+
+        fs::remove_file(&base_path).expect("delete base.lua");
+        let base_uri = crate::uri::path_to_uri(&base_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": base_uri.to_string(), "type": 3 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        let after = drain(&client);
+
+        let republished = published_diagnostics(&after, &main_uri).expect(
+            "main.lua must be republished by the DELETED event itself, not left \
+             for the next keystroke",
+        );
+        assert!(
+            republished.as_array().is_some_and(|d| !d.is_empty()),
+            "s.id must now be flagged now that Base is gone: {republished:?}"
+        );
+    }
+
+    /// Production readiness review, finding 4, end to end: checking one
+    /// document can produce an `LB0318` about a class declared in *another*
+    /// file. It must reach the user as a diagnostic on that other document,
+    /// at that document's own line — not inside the checked document at a
+    /// position clamped into its (shorter) text.
+    ///
+    /// `c.lua`'s declaration is padded well past `a.lua`'s length, so the
+    /// line asserted below is one a conversion through `a.lua`'s index could
+    /// not have produced.
+    #[test]
+    fn a_cross_file_cycle_publishes_its_diagnostic_on_the_declaring_document() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let a_path = root.join("a.lua");
+        let c_path = root.join("c.lua");
+        let a_source = "---@class A : B\n\n---@type B\nlocal v = nil\nlocal _ = v.whatever\n";
+        let mut c_source = String::new();
+        for i in 0..40 {
+            let _ = writeln!(c_source, "-- padding line {i}");
+        }
+        c_source.push_str("---@class B : A\n---@field id number\n");
+        fs::write(&a_path, a_source).expect("write a.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let a_uri = crate::uri::path_to_uri(&a_path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": a_uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": a_source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let published = drain(&client);
+
+        let c_uri = crate::uri::path_to_uri(&c_path);
+        let for_c = published_diagnostics(&published, &c_uri)
+            .expect("the cycle's own declaring document is published too");
+        let cyclic = for_c
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|d| d["code"] == "LB0318")
+            .unwrap_or_else(|| panic!("expected LB0318 on c.lua: {for_c:?}"));
+        let declared_on = c_source
+            .lines()
+            .position(|line| line.starts_with("---@class B"))
+            .expect("c.lua declares B");
+        assert_eq!(cyclic["range"]["start"]["line"], json!(declared_on));
+
+        let for_a = published_diagnostics(&published, &a_uri).expect("a.lua is published");
+        let a_lines = u64::try_from(a_source.lines().count()).expect("a small line count");
+        for diag in for_a.as_array().expect("an array") {
+            // `A` is a member of the same cycle and IS declared in a.lua, so
+            // a.lua carries its own `LB0318` — luals reports both
+            // declarations of a mutual cycle and, as of round 12 R12-1, so
+            // does this server. What may never appear here is `B`'s, whose
+            // declaration lives in c.lua.
+            assert!(
+                !diag["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("`B`'s `---@class` ancestry")),
+                "{diag:?}"
+            );
+            assert!(
+                diag["range"]["start"]["line"].as_u64().expect("a line") < a_lines,
+                "nothing may render at a clamped position: {diag:?}"
+            );
+        }
+    }
+
+    /// Production readiness review, finding 2: the CREATED/CHANGED mirror of
+    /// the test above. M58 taught the DELETED arm to republish open
+    /// consumers and stopped there, so the event that *restores* a
+    /// dependency — a `git checkout` of a branch that has `base.lua`, an
+    /// external edit that adds the missing `---@field` — left every open
+    /// consumer showing the diagnostic the restore had just fixed, until
+    /// that buffer's own next keystroke.
+    ///
+    /// Same shape as the deletion test, run backwards: `main.lua` is open
+    /// and flagged because `base.lua` does not exist; `base.lua` is written
+    /// and announced as CREATED; `main.lua`'s stale diagnostic must clear in
+    /// that same batch.
+    #[test]
+    fn a_created_watched_file_republishes_diagnostics_for_an_open_consumer() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let base_path = root.join("base.lua");
+        let main_path = root.join("main.lua");
+        let source = "\
+---@class Sub : Base
+
+---@param s Sub
+local function use(s) print(s.id) end
+
+return use
+";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let main_uri = crate::uri::path_to_uri(&main_path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": main_uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let opened = drain(&client);
+        let before = published_diagnostics(&opened, &main_uri)
+            .expect("didOpen publishes main.lua's diagnostics");
+        assert!(
+            before.as_array().is_some_and(|d| !d.is_empty()),
+            "s.id must be flagged while Base is absent: {before:?}"
+        );
+
+        fs::write(&base_path, "---@class Base\n---@field id number\n").expect("write base.lua");
+        let base_uri = crate::uri::path_to_uri(&base_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": base_uri.to_string(), "type": 1 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        let after = drain(&client);
+
+        let republished = published_diagnostics(&after, &main_uri).expect(
+            "main.lua must be republished by the CREATED event itself, not left \
+             for the next keystroke",
+        );
+        assert!(
+            republished.as_array().is_some_and(Vec::is_empty),
+            "s.id resolves now that Base exists: {republished:?}"
+        );
+    }
+
+    /// H1: a batch of D deleted files must republish each open document
+    /// exactly once (O total), not once per deleted file (D×O) — a branch
+    /// switch or `git clean` deletes many files in a single
+    /// `didChangeWatchedFiles` notification, and calling
+    /// `republish_open_docs` (a fresh `Analysis` snapshot plus a full
+    /// diagnostics pass per open document) from inside the per-event loop
+    /// instead of once after it turns that single batch into a
+    /// multiplicative, user-visible stall. Two deleted files, three open
+    /// documents: republished-open-doc notifications must total 3, not 6.
+    #[test]
+    fn a_batch_of_deleted_files_republishes_open_docs_once_each_not_once_per_deletion() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+
+        let del_paths: Vec<_> = ["del1.lua", "del2.lua"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                fs::write(&path, "local x = 1\n").expect("write deleted file");
+                path
+            })
+            .collect();
+
+        let open_uris: Vec<_> = ["open1.lua", "open2.lua", "open3.lua"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                let source = "local x = 1\n";
+                fs::write(&path, source).expect("write open file");
+                path
+            })
+            .collect();
+        server.bootstrap();
+        drop(drain(&client));
+
+        let open_uris: Vec<_> = open_uris
+            .into_iter()
+            .map(|path| {
+                let uri = crate::uri::path_to_uri(&path);
+                server
+                    .handle_notification(Notification {
+                        method: DidOpenTextDocument::METHOD.to_string(),
+                        params: json!({
+                            "textDocument": {
+                                "uri": uri.to_string(),
+                                "languageId": "lua",
+                                "version": 1,
+                                "text": "local x = 1\n",
+                            },
+                        }),
+                    })
+                    .expect("didOpen");
+                uri
+            })
+            .collect();
+        drop(drain(&client));
+
+        for path in &del_paths {
+            fs::remove_file(path).expect("delete file");
+        }
+        let changes: Vec<Value> = del_paths
+            .iter()
+            .map(|path| json!({ "uri": crate::uri::path_to_uri(path).to_string(), "type": 3 }))
+            .collect();
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({ "changes": changes }),
+            })
+            .expect("didChangeWatchedFiles");
+        let after = drain(&client);
+
+        let republish_count = after
+            .iter()
+            .filter(|m| match m {
+                Message::Notification(not) => {
+                    not.method == PublishDiagnostics::METHOD
+                        && open_uris.iter().any(|u| not.params["uri"] == *u.as_str())
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            republish_count,
+            open_uris.len(),
+            "2 deleted files × 3 open docs must republish each open doc once (3), \
+             not once per deletion (6): {after:?}"
+        );
+    }
+
+    // === cross-file diagnostic bookkeeping (round 8 review, F4) ===========
+
+    /// The `a.lua`/`c.lua` cycle fixture the finding-4 test above uses: `a`
+    /// consumes `B` and so is the file whose pass produces the `LB0318`, and
+    /// `B` is declared in `c`, so the diagnostic belongs to `c`'s document.
+    /// `c` is padded well past `a`'s length for the same reason as there.
+    fn cycle_pair(suffix: &str) -> (String, String) {
+        let a = format!(
+            "---@class A{suffix} : B{suffix}\n\n---@type B{suffix}\n\
+             local v = nil\nlocal _ = v.whatever\n"
+        );
+        let mut c = String::new();
+        for i in 0..40 {
+            let _ = writeln!(c, "-- padding line {i}");
+        }
+        let _ = writeln!(c, "---@class B{suffix} : A{suffix}");
+        let _ = writeln!(c, "---@field id number");
+        (a, c)
+    }
+
+    /// `textDocument/didOpen` for `path` carrying `text`.
+    fn did_open(server: &mut Server, path: &Path, text: &str) {
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": crate::uri::path_to_uri(path).to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": text,
+                    },
+                }),
+            })
+            .expect("didOpen");
+    }
+
+    /// A whole-document `textDocument/didChange` for `path`.
+    fn did_change(server: &mut Server, path: &Path, text: &str) {
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": crate::uri::path_to_uri(path).to_string(), "version": 2 },
+                    "contentChanges": [{ "text": text }],
+                }),
+            })
+            .expect("didChange");
+    }
+
+    /// A `textDocument/didClose` for `path`.
+    fn did_close(server: &mut Server, path: &Path) {
+        server
+            .handle_notification(Notification {
+                method: DidCloseTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": crate::uri::path_to_uri(path).to_string() },
+                }),
+            })
+            .expect("didClose");
+    }
+
+    /// A `workspace/didChangeWatchedFiles` announcing `typ` for `path`.
+    fn watched(server: &mut Server, path: &Path, typ: u8) {
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{
+                        "uri": crate::uri::path_to_uri(path).to_string(),
+                        "type": typ,
+                    }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+    }
+
+    /// The diagnostic codes of the last publish for `path` in `messages`.
+    fn published_codes(messages: &[Message], path: &Path) -> Option<Vec<String>> {
+        let uri = crate::uri::path_to_uri(path);
+        published_diagnostics(messages, &uri).map(|diags| {
+            diags
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|d| d["code"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+    }
+
+    /// F4, the **clear**: the group is produced by `a.lua`'s pass, so fixing
+    /// `a.lua` means the next pass produces no group at all — and the code
+    /// this pins replaced only ever republished the targets of groups it had
+    /// *just produced*, so "no group" meant "nothing to republish" and
+    /// `c.lua`'s panel kept a diagnostic about a cycle that no longer
+    /// existed, until `c.lua` was itself touched.
+    #[test]
+    fn fixing_the_declaring_file_clears_its_cross_file_diagnostic_in_the_same_batch() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a_source, c_source) = cycle_pair("");
+        let a_path = root.join("a.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a_path, &a_source).expect("write a.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, &a_source);
+        let opened = drain(&client);
+        assert!(
+            published_codes(&opened, &c_path)
+                .expect("c.lua is published")
+                .contains(&"LB0318".to_string()),
+            "the cycle must reach c.lua's panel first: {opened:?}"
+        );
+
+        // The fix: `A` no longer inherits `B`, so nothing is cyclic.
+        did_change(&mut server, &a_path, "---@class A\n");
+        let fixed = drain(&client);
+        let codes = published_codes(&fixed, &c_path).expect(
+            "c.lua must be republished by the edit that fixed the cycle, not \
+             left showing it until c.lua is itself touched",
+        );
+        assert!(
+            !codes.contains(&"LB0318".to_string()),
+            "the cleared cycle must leave c.lua's panel: {codes:?}"
+        );
+    }
+
+    /// F4, the **keystroke**: the group lives on `c.lua`'s document but is
+    /// produced by `a.lua`'s pass, so publishing `c.lua` — which a keystroke
+    /// in it does — used to replace its set with its own half alone and the
+    /// diagnostic silently disappeared. Typing in a file must not delete a
+    /// finding about it.
+    #[test]
+    fn editing_the_painted_on_file_keeps_the_cross_file_diagnostic_another_file_produced() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a_source, c_source) = cycle_pair("");
+        let a_path = root.join("a.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a_path, &a_source).expect("write a.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, &a_source);
+        drop(drain(&client));
+
+        // Open `c.lua` and type in it. Neither its own pass nor the edit
+        // touches `a.lua`'s finding, so it must still be there afterwards.
+        did_open(&mut server, &c_path, &c_source);
+        let opened = drain(&client);
+        assert!(
+            published_codes(&opened, &c_path)
+                .expect("c.lua is published on open")
+                .contains(&"LB0318".to_string()),
+            "opening the painted-on file must not blank the finding: {opened:?}"
+        );
+
+        did_change(&mut server, &c_path, &format!("{c_source}-- a keystroke\n"));
+        let typed = drain(&client);
+        assert!(
+            published_codes(&typed, &c_path)
+                .expect("c.lua is published on the keystroke")
+                .contains(&"LB0318".to_string()),
+            "and neither must a keystroke in it: {typed:?}"
+        );
+    }
+
+    /// F4, **two producers**: `c.lua` declares two cyclic classes, each
+    /// completed by a different consumer. Both consumers' findings belong to
+    /// `c.lua`'s document, so both must be on it — the code this pins let
+    /// whichever consumer published last replace the other's.
+    #[test]
+    fn two_files_contributing_cross_file_diagnostics_to_one_target_both_show() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a1_source, c1) = cycle_pair("1");
+        let (a2_source, c2) = cycle_pair("2");
+        let c_source = format!("{c1}{c2}");
+        let a1_path = root.join("a1.lua");
+        let a2_path = root.join("a2.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a1_path, &a1_source).expect("write a1.lua");
+        fs::write(&a2_path, &a2_source).expect("write a2.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a1_path, &a1_source);
+        did_open(&mut server, &a2_path, &a2_source);
+        let opened = drain(&client);
+
+        let codes = published_codes(&opened, &c_path).expect("c.lua is published");
+        let cycles = codes.iter().filter(|c| *c == "LB0318").count();
+        assert_eq!(
+            cycles, 2,
+            "both consumers' findings belong to c.lua's document; the second \
+             publish must merge with the first, not replace it: {codes:?}"
+        );
+    }
+
+    /// F4, **determinism**: a batch republish publishes as it walks the open
+    /// documents, so the walk order is on the wire. Over a `HashMap` that
+    /// order was hash order — an unchanged workspace emitted a differently
+    /// ordered batch run to run, and (before the ledger) a different
+    /// surviving cross-file group with it.
+    #[test]
+    fn a_batch_republish_walks_the_open_documents_in_path_order() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        // Opened in an order that is not the sorted one, so passing this
+        // cannot be an accident of insertion order.
+        let opened_in = ["e.lua", "a.lua", "d.lua", "b.lua", "c.lua"];
+        let paths: Vec<PathBuf> = opened_in.iter().map(|name| root.join(name)).collect();
+        for path in &paths {
+            fs::write(path, "local x = 1\n").expect("write");
+        }
+        server.bootstrap();
+        drop(drain(&client));
+        for path in &paths {
+            did_open(&mut server, path, "local x = 1\n");
+        }
+        drop(drain(&client));
+
+        server
+            .handle_notification(Notification {
+                method: DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            })
+            .expect("didChangeConfiguration");
+        let batch = drain(&client);
+
+        let published: Vec<String> = batch
+            .iter()
+            .filter_map(|m| match m {
+                Message::Notification(not) if not.method == PublishDiagnostics::METHOD => {
+                    Some(not.params["uri"].as_str().unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        let expected: Vec<String> = sorted
+            .iter()
+            .map(|p| crate::uri::path_to_uri(p).to_string())
+            .collect();
+        assert_eq!(
+            published, expected,
+            "a republish batch must be in path order, not hash order"
+        );
+    }
+
+    /// A hand-built diagnostic for the ledger tests below, distinguishable
+    /// by `message` alone.
+    fn ledger_diagnostic(message: &str) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            message: message.to_owned(),
+            ..lsp_types::Diagnostic::default()
+        }
+    }
+
+    /// The messages `target`'s document would currently show.
+    fn ledger_messages(ledger: &ForeignLedger, target: &Path) -> Vec<String> {
+        ledger
+            .published_set(target)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// F4 (**two producers**) and R11-6a (**fix one, keep the other**), at
+    /// the ledger rather than through the server.
+    ///
+    /// These two properties used to be pinned end to end on the cross-file
+    /// `LB0318` fixtures below. They no longer can be: as of round 12 R12-1
+    /// the declared-class cycle set is derived from the WORKSPACE, so it
+    /// travels in [`ForeignLedger::workspace`] and no longer exercises
+    /// [`ForeignLedger::contributions`] at all — measured, by deleting the
+    /// whole contributor merge from `published_set`: the entire suite stayed
+    /// green. The per-contributor mechanism is still live (every other
+    /// cross-file ancestry finding — `LB0317`'s and `LB0319`'s
+    /// `cross_file_class_decl_span` tier — travels in it), and pinning it on
+    /// a real 200-class fixture costs a full editor check pass per
+    /// keystroke of the test. So it is pinned here, on the map itself, where
+    /// the mutation that would break it fails immediately.
+    #[test]
+    fn two_contributors_groups_for_one_target_both_appear_and_clear_independently() {
+        let target = PathBuf::from("c.lua");
+        let a1 = PathBuf::from("a1.lua");
+        let a2 = PathBuf::from("a2.lua");
+        let mut ledger = ForeignLedger::default();
+
+        ledger.record(
+            &a1,
+            Vec::new(),
+            BTreeMap::from([(target.clone(), vec![ledger_diagnostic("from a1")])]),
+            WorkspaceScan::Skipped,
+        );
+        let affected = ledger.record(
+            &a2,
+            Vec::new(),
+            BTreeMap::from([(target.clone(), vec![ledger_diagnostic("from a2")])]),
+            WorkspaceScan::Skipped,
+        );
+        assert!(affected.contains(&target), "{affected:?}");
+        assert_eq!(
+            ledger_messages(&ledger, &target),
+            vec!["from a1".to_owned(), "from a2".to_owned()],
+            "the second contributor merges with the first, it does not replace it"
+        );
+
+        // a1 is re-checked and no longer produces anything: its group goes,
+        // a2's stays. A `record` that stripped the target from every
+        // contributor — or a `published_set` that read only the publishing
+        // one — would take a2's finding down with it and leave a real
+        // finding invisible until a2.lua is itself touched.
+        let affected = ledger.record(&a1, Vec::new(), BTreeMap::new(), WorkspaceScan::Skipped);
+        assert!(
+            affected.contains(&target),
+            "the target of a group that just went away is still republished: {affected:?}"
+        );
+        assert_eq!(
+            ledger_messages(&ledger, &target),
+            vec!["from a2".to_owned()]
+        );
+    }
+
+    /// R12-1: the workspace half is REPLACED by each pass that computes it,
+    /// never merged — and a pass that did not compute it leaves it alone.
+    ///
+    /// Both halves matter. Merging would put one cycle on a document once
+    /// per file the session ever checked; treating "did not compute" as
+    /// "computed empty" would wipe every cycle off every document the moment
+    /// a publish for a path the analysis does not know went through
+    /// ([`Server::publish_lua`]'s `None` arm, the one remaining
+    /// [`WorkspaceScan::Skipped`] caller).
+    #[test]
+    fn the_workspace_half_is_replaced_by_a_pass_and_untouched_by_one_that_skips_it() {
+        let target = PathBuf::from("c.lua");
+        let stale = PathBuf::from("gone.lua");
+        let a1 = PathBuf::from("a1.lua");
+        let a2 = PathBuf::from("a2.lua");
+        let mut ledger = ForeignLedger::default();
+
+        ledger.record(
+            &a1,
+            Vec::new(),
+            BTreeMap::new(),
+            WorkspaceScan::Recomputed(BTreeMap::from([
+                (target.clone(), vec![ledger_diagnostic("cycle")]),
+                (stale.clone(), vec![ledger_diagnostic("other cycle")]),
+            ])),
+        );
+        // a2's pass sees the same workspace minus `gone.lua`'s cycle.
+        let affected = ledger.record(
+            &a2,
+            Vec::new(),
+            BTreeMap::new(),
+            WorkspaceScan::Recomputed(BTreeMap::from([(
+                target.clone(),
+                vec![ledger_diagnostic("cycle")],
+            )])),
+        );
+        assert!(
+            affected.contains(&stale),
+            "a target that dropped out of the workspace answer is republished without it: \
+             {affected:?}"
+        );
+        assert_eq!(ledger_messages(&ledger, &target), vec!["cycle".to_owned()]);
+        assert!(ledger_messages(&ledger, &stale).is_empty());
+
+        // A publish that computed nothing (the scratch-buffer didClose path)
+        // must not read as "the workspace is clean".
+        ledger.record(&a1, Vec::new(), BTreeMap::new(), WorkspaceScan::Skipped);
+        assert_eq!(
+            ledger_messages(&ledger, &target),
+            vec!["cycle".to_owned()],
+            "`Skipped` keeps the stored answer; `Recomputed(empty)` would have wiped it"
+        );
+    }
+
+    /// R11-6a, the **fix-one-keep-other transition**, end to end. Two
+    /// contributors, one target: what happens to the OTHER finding when one
+    /// file is re-checked and its own goes away. Since R12-1 the cycle set
+    /// is workspace-derived, so what this fixture exercises end to end is
+    /// [`ForeignLedger::workspace`]'s wholesale replacement — the
+    /// per-contributor half of the same property is pinned on the ledger
+    /// directly, above.
+    ///
+    /// Proved by hand, the way the F7 gate test above was: `record` was
+    /// temporarily taught to strip a stale target from **every** contributor
+    /// rather than only from `source`'s own entry. This test went RED (0
+    /// cycles on `c.lua` instead of 1) and the four F4 tests above all stayed
+    /// GREEN under that same variant — which is exactly why this one had to
+    /// exist.
+    #[test]
+    fn fixing_one_contributor_keeps_the_other_contributors_group_on_the_target() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a1_source, c1) = cycle_pair("1");
+        let (a2_source, c2) = cycle_pair("2");
+        let c_source = format!("{c1}{c2}");
+        let a1_path = root.join("a1.lua");
+        let a2_path = root.join("a2.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a1_path, &a1_source).expect("write a1.lua");
+        fs::write(&a2_path, &a2_source).expect("write a2.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a1_path, &a1_source);
+        did_open(&mut server, &a2_path, &a2_source);
+        let opened = drain(&client);
+        assert_eq!(
+            published_codes(&opened, &c_path)
+                .expect("c.lua is published")
+                .iter()
+                .filter(|code| *code == "LB0318")
+                .count(),
+            2,
+            "both contributors must be on c.lua before the fix, or the \
+             transition below proves nothing: {opened:?}"
+        );
+
+        // Fix `a1.lua` alone: `A1` no longer inherits `B1`, so a1 contributes
+        // nothing. `a2.lua` is untouched and its cycle is still real.
+        did_change(&mut server, &a1_path, "---@class A1\n");
+        let fixed = drain(&client);
+        let codes = published_codes(&fixed, &c_path)
+            .expect("c.lua must be republished by the edit that fixed a1's cycle");
+        assert_eq!(
+            codes.iter().filter(|code| *code == "LB0318").count(),
+            1,
+            "fixing one contributor must clear its group and keep the \
+             other's, not clear the target: {codes:?}"
+        );
+    }
+
+    /// Round 13 review, the per-keystroke workspace rebuild: the cycle pass
+    /// is derived at most once per host revision, and a new revision derives
+    /// a new one.
+    ///
+    /// Asserted on identity, not on a log line: the answer is a pure function
+    /// of the analysis and the strictness, so two computations at one
+    /// revision are indistinguishable by their contents and only `Rc::ptr_eq`
+    /// can tell a cache hit from an honest recompute. Drop the revision check
+    /// in `cycle_pass` and the first assertion fails; drop the store and the
+    /// same one does.
+    #[test]
+    fn the_workspace_cycle_pass_is_derived_once_per_revision() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "---@class Ring : Ring\n").expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        // Scoped: an outstanding `Analysis` blocks the host's next
+        // `apply_change`, so the snapshot must not outlive the reads it is
+        // for. The `Rc` may — it holds diagnostics, not the database.
+        let (first, before) = {
+            let snapshot = server.host.snapshot();
+            let first = server.cycle_pass(&snapshot);
+            let second = server.cycle_pass(&snapshot);
+            assert!(
+                Rc::ptr_eq(&first, &second),
+                "a second read at the same revision must reuse the pass, not \
+                 re-collect every `---@class` in the workspace"
+            );
+            (first, snapshot.revision())
+        };
+
+        // A keystroke bumps the revision, and the answer may genuinely have
+        // moved with it — the cache must not outlive its key.
+        did_open(&mut server, &path, "---@class Ring : Ring\n-- typed\n");
+        drop(drain(&client));
+        let after = server.host.snapshot();
+        assert_ne!(after.revision(), before, "the edit landed");
+        assert!(
+            !Rc::ptr_eq(&first, &server.cycle_pass(&after)),
+            "a new revision derives a new pass"
+        );
+    }
+
+    /// R13-A: the close of a document with no disk backing must recompute
+    /// the workspace half, not skip it — the cycle it was holding up is
+    /// genuinely over the instant its overlay drops.
+    ///
+    /// The exact sequence, in order, because every step matters:
+    ///
+    /// 1. `a.lua` and `b.lua` declare a mutual `---@class` cycle; both open.
+    ///    `b.lua`'s panel carries an `LB0318`.
+    /// 2. `a.lua` is deleted on disk and announced. The watched-DELETE arm
+    ///    blanks the DISK text, but the editor overlay still shadows it, so
+    ///    `A` is still declared and the cycle is still real — asserted,
+    ///    because if it cleared here the step below would prove nothing.
+    /// 3. The user closes the orphaned tab. `read_to_string` fails, the
+    ///    overlay drops, and now nothing in the workspace declares `A`.
+    ///
+    /// At step 3 the close handler passed `workspace: None` — "not
+    /// recomputed" — so the stored answer stood: `b.lua` kept an error naming
+    /// a class that no longer exists anywhere, on a clean open file, until a
+    /// keystroke, a config reload or reopening `a.lua` happened to run
+    /// another pass. RED at `d1a7381`: `b.lua` is not in the affected set at
+    /// all, so the `expect` below fires.
+    #[test]
+    fn closing_a_deleted_buffer_clears_the_cycle_it_was_the_last_declaration_of() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let a_path = root.join("a.lua");
+        let b_path = root.join("b.lua");
+        let a_source = "---@class A : B\n";
+        let b_source = "---@class B : A\n";
+        fs::write(&a_path, a_source).expect("write a.lua");
+        fs::write(&b_path, b_source).expect("write b.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, a_source);
+        did_open(&mut server, &b_path, b_source);
+        let opened = drain(&client);
+        assert!(
+            published_codes(&opened, &b_path)
+                .expect("b.lua is published")
+                .contains(&"LB0318".to_string()),
+            "the cycle must be on b.lua's panel first: {opened:?}"
+        );
+
+        fs::remove_file(&a_path).expect("delete a.lua");
+        watched(&mut server, &a_path, 3);
+        let deleted = drain(&client);
+        assert!(
+            published_codes(&deleted, &b_path)
+                .expect("the DELETE republishes every open document")
+                .contains(&"LB0318".to_string()),
+            "the overlay still declares `A`, so the cycle is still real here — \
+             if it cleared now, the close below would prove nothing: {deleted:?}"
+        );
+
+        did_close(&mut server, &a_path);
+        let closed = drain(&client);
+        let codes = published_codes(&closed, &b_path).expect(
+            "b.lua must be republished by the close that removed the cycle's \
+             last remaining declaration",
+        );
+        assert!(
+            !codes.contains(&"LB0318".to_string()),
+            "nothing declares `A` any more; the cycle must leave b.lua's panel \
+             in this batch, not on some later keystroke: {codes:?}"
+        );
+    }
+
+    /// R13-C: a cycle that exists ONLY because two files' declarations of one
+    /// name union, reported by the editor, attributed per declaration.
+    ///
+    /// `a.lua` declares `A` plainly, `b.lua` reopens it as `A : B`, `c.lua`
+    /// declares `B : A`. No single file contains a cycle; the union does. The
+    /// server builds its own graph over its own file iteration, and until
+    /// this test nothing exercised that path across files — the CLI's union
+    /// tests could not, because they run the other surface's harvest.
+    ///
+    /// Attribution is the other half: `b.lua` and `c.lua` carry the finding
+    /// because their OWN parent lists close the loop; `a.lua`'s plain
+    /// `---@class A` does not and must stay clean, exactly as luals leaves it.
+    #[test]
+    fn the_editor_reports_a_cycle_formed_only_by_the_union_across_files() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let a_path = root.join("a.lua");
+        let b_path = root.join("b.lua");
+        let c_path = root.join("c.lua");
+        let (a_source, b_source, c_source) =
+            ("---@class A\n", "---@class A : B\n", "---@class B : A\n");
+        fs::write(&a_path, a_source).expect("write a.lua");
+        fs::write(&b_path, b_source).expect("write b.lua");
+        fs::write(&c_path, c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, a_source);
+        let published = drain(&client);
+
+        for (path, member) in [(&b_path, "`A`'s"), (&c_path, "`B`'s")] {
+            let diags = published_diagnostics(&published, &crate::uri::path_to_uri(path))
+                .unwrap_or_else(|| panic!("{} must be published", path.display()));
+            let cyclic: Vec<&Value> = diags
+                .as_array()
+                .expect("an array")
+                .iter()
+                .filter(|d| d["code"] == "LB0318")
+                .collect();
+            assert_eq!(
+                cyclic.len(),
+                1,
+                "one finding on the declaration that closes the loop: {diags:?}"
+            );
+            assert!(
+                cyclic[0]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(member)),
+                "{} names its own class: {cyclic:?}",
+                path.display()
+            );
+        }
+
+        // The declaration that opened `A` without a parent is not a cycle
+        // edge, so it draws nothing — the union finds the cycle, it does not
+        // flatten the blame onto every declaration of a member.
+        let for_a =
+            published_codes(&published, &a_path).expect("a.lua is published, it was opened");
+        assert!(
+            !for_a.contains(&"LB0318".to_string()),
+            "the plain `---@class A` is innocent: {for_a:?}"
+        );
+    }
+
+    /// R11-4: `own` is the twin of `contributions` and must self-prune the
+    /// same way. A didClose of a buffer with no disk backing records an empty
+    /// own half — and an empty entry is indistinguishable from an absent one
+    /// at `published_set`, so storing it buys nothing and grows the map by one
+    /// entry per distinct file ever checked in a session.
+    #[test]
+    fn a_did_close_prunes_the_files_empty_own_half_from_the_ledger() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let path = root.join("scratch.lua");
+        let source = "local x = \n";
+        fs::write(&path, source).expect("write scratch.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &path, source);
+        drop(drain(&client));
+        assert!(
+            server
+                .foreign
+                .own
+                .get(&path)
+                .is_some_and(|own| !own.is_empty()),
+            "the syntax error must be recorded as a non-empty own half first, \
+             or the prune below proves nothing"
+        );
+
+        // No disk backing left, so `close` takes the scratch-buffer path and
+        // records an empty own half through the ledger.
+        fs::remove_file(&path).expect("delete scratch.lua");
+        server
+            .handle_notification(Notification {
+                method: DidCloseTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": crate::uri::path_to_uri(&path).to_string() },
+                }),
+            })
+            .expect("didClose");
+
+        assert!(
+            !server.foreign.own.contains_key(&path),
+            "an empty own half must be removed, not stored: {:?}",
+            server.foreign.own.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// R11-4, the other path `contributions` is pruned on: a watched DELETE
+    /// empties the file's text, so its next pass has nothing to report and
+    /// records an empty own half. Same leak, same prune.
+    #[test]
+    fn a_watched_delete_prunes_the_files_empty_own_half_from_the_ledger() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let path = root.join("orphan.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        fs::write(&path, "local x = \n").expect("write orphan.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        // CHANGED, not open: publishes from disk and records the own half.
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({ "changes": [{ "uri": uri.to_string(), "type": 2 }] }),
+            })
+            .expect("didChangeWatchedFiles");
+        drop(drain(&client));
+        assert!(
+            server
+                .foreign
+                .own
+                .get(&path)
+                .is_some_and(|own| !own.is_empty()),
+            "the syntax error must be recorded as a non-empty own half first, \
+             or the prune below proves nothing"
+        );
+
+        fs::remove_file(&path).expect("delete orphan.lua");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({ "changes": [{ "uri": uri.to_string(), "type": 3 }] }),
+            })
+            .expect("didChangeWatchedFiles");
+
+        assert!(
+            !server.foreign.own.contains_key(&path),
+            "a deleted file must leave no empty own entry behind: {:?}",
+            server.foreign.own.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The last `textDocument/publishDiagnostics` notification for `uri` in
+    /// `messages`, if any.
+    fn published_diagnostics(messages: &[Message], uri: &lsp_types::Uri) -> Option<Value> {
+        messages.iter().rev().find_map(|m| match m {
+            Message::Notification(not)
+                if not.method == PublishDiagnostics::METHOD
+                    && not.params["uri"] == *uri.as_str() =>
+            {
+                Some(not.params["diagnostics"].clone())
+            }
+            _ => None,
+        })
+    }
+
     // === Malformed messages ===============================================
     //
     // The server is spoken to by editors, and editors send nonsense: params
@@ -2538,10 +4939,24 @@ mod tests {
 
     /// The same, with the client's `window.workDoneProgress` capability set
     /// explicitly — every `$/progress` the server sends is gated on it.
+    /// Trace defaults to `Off`, matching a real client that never sets it —
+    /// [`test_server_with_trace`] is the one to reach for when a test
+    /// actually asserts on `Self::merged_ambient`'s log.
     fn test_server_with(progress: bool) -> (TempDir, Server, Connection) {
+        test_server_full(progress, TraceValue::Off)
+    }
+
+    /// [`test_server`] with the trace level set explicitly (N22) — for the
+    /// handful of tests that assert on the "merged ambient rebuilt@" log,
+    /// which is now silent unless a client opts in.
+    fn test_server_with_trace(trace: TraceValue) -> (TempDir, Server, Connection) {
+        test_server_full(true, trace)
+    }
+
+    fn test_server_full(progress: bool, trace: TraceValue) -> (TempDir, Server, Connection) {
         let dir = TempDir::new().expect("tempdir");
         let (server_end, client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf(), progress);
+        let server = Server::new(server_end, dir.path().to_path_buf(), progress, trace);
         (dir, server, client)
     }
 
@@ -2653,15 +5068,33 @@ mod tests {
 
     /// The `window/logMessage` payloads the server has sent.
     fn log_messages(messages: &[Message]) -> Vec<String> {
+        logged(messages).into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// Log-pane messages at one severity. `log_messages` erases the level,
+    /// so a test that cares which pane the client paints — WARNING is a
+    /// visible complaint, LOG is not — has to key on it.
+    fn log_messages_at(messages: &[Message], typ: MessageType) -> Vec<String> {
+        logged(messages)
+            .into_iter()
+            .filter(|(t, _)| *t == typ)
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Every `window/logMessage` the server has sent, severity kept.
+    fn logged(messages: &[Message]) -> Vec<(MessageType, String)> {
         messages
             .iter()
             .filter_map(|m| match m {
-                Message::Notification(not) if not.method == super::LogMessage::METHOD => Some(
+                Message::Notification(not) if not.method == super::LogMessage::METHOD => Some((
+                    serde_json::from_value(not.params["type"].clone())
+                        .expect("`window/logMessage` carries a `type`"),
                     not.params["message"]
                         .as_str()
                         .unwrap_or_default()
                         .to_owned(),
-                ),
+                )),
                 _ => None,
             })
             .collect()
@@ -2739,6 +5172,291 @@ mod tests {
             "{error}"
         );
     }
+
+    // === didChange for a document the client never opened =================
+    //
+    // #78. `didChange` carries *edits*, not state: a ranged change is only
+    // meaningful against the buffer it indexes into, and only an open
+    // document has one. Without a `didOpen` there is nothing to splice into
+    // but the empty string, or — for a file `bootstrap` indexed — a disk
+    // text the client never agreed to. Either way the result is a document
+    // invented out of a fragment, stored as the overlay and published as
+    // diagnostics. The client is never told; it just sees nonsense in the
+    // problems pane for a file it believes is fine.
+
+    /// The one edit shape that carries no base text of its own is dropped,
+    /// and the client is told why — no overlay written, no diagnostics for
+    /// the fragment.
+    #[test]
+    fn a_ranged_did_change_for_an_unopened_document_is_logged_and_dropped() {
+        let (dir, mut server, client) = test_server();
+        // Never written to disk, never opened, never indexed: the host has
+        // no text for it, which is precisely the state the guard is about.
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 },
+                        },
+                        "text": "local x = ",
+                    }],
+                }),
+            })
+            .expect("a didChange for an unknown document is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "an edit with no base text must not publish diagnostics for the \
+             fragment it would have spliced: {messages:?}"
+        );
+        assert!(
+            server.host.snapshot().file_text(&path).is_none(),
+            "and it must not invent the document in the host either"
+        );
+        let logged = log_messages(&messages);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didChange") && m.contains("never_opened.lua")),
+            "{logged:?}"
+        );
+    }
+
+    /// An empty batch carries no edit at all, so it is a legal no-op rather
+    /// than the "no base text" case the ranged-and-unopened guard above logs
+    /// a warning for — nothing to splice, nothing to warn about.
+    #[test]
+    fn an_empty_did_change_batch_on_an_unopened_document_is_silent() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [],
+                }),
+            })
+            .expect("an empty didChange batch is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "an empty batch has nothing to publish: {messages:?}"
+        );
+        assert!(
+            server.host.snapshot().file_text(&path).is_none(),
+            "and it must not invent the document in the host either"
+        );
+        assert!(
+            log_messages(&messages).is_empty(),
+            "a legal no-op must not be logged as though it were: {messages:?}"
+        );
+    }
+
+    /// The other shape carries the whole document, so it needs no base text
+    /// — a client that syncs in full mode, or replaces the buffer wholesale,
+    /// still works on a document the server has not seen. The guard is about
+    /// missing base text, not about the notification's provenance.
+    #[test]
+    fn a_full_text_did_change_for_an_unopened_document_is_applied() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local x = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_some(),
+            "a full-replace change is self-contained: {messages:?}"
+        );
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local x = 1\n"),
+        );
+    }
+
+    /// A ranged edit that *follows* a full replace in the same batch has a
+    /// base text — the one the replace just established — so the batch is
+    /// applied whole. The guard keys on the first change, not on "any
+    /// change has a range".
+    #[test]
+    fn a_full_replace_then_a_ranged_edit_for_an_unopened_document_is_applied() {
+        let (dir, mut server, _client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [
+                        { "text": "local x = 1\n" },
+                        {
+                            "range": {
+                                "start": { "line": 0, "character": 10 },
+                                "end": { "line": 0, "character": 11 },
+                            },
+                            "text": "2",
+                        },
+                    ],
+                }),
+            })
+            .expect("didChange");
+
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local x = 2\n"),
+        );
+    }
+
+    /// The mirror shape of the test above: a full replace *following* a
+    /// ranged edit does not rescue the batch. The gate is on the first
+    /// change alone — a batch that begins ranged already has nothing to
+    /// splice into, and a later full replace in it does not change that: an
+    /// off-spec client that lost sync once is not trusted to have found it
+    /// again mid-batch.
+    #[test]
+    fn a_batch_that_begins_ranged_is_dropped_even_if_it_ends_in_a_full_replace() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [
+                        {
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 },
+                            },
+                            "text": "local x = ",
+                        },
+                        { "text": "local x = 1\n" },
+                    ],
+                }),
+            })
+            .expect("didChange");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "a batch that begins ranged is dropped whole, full replace or \
+             not: {messages:?}"
+        );
+        assert!(
+            server.host.snapshot().file_text(&path).is_none(),
+            "and it must not invent the document in the host either"
+        );
+        let logged = log_messages_at(&messages, MessageType::WARNING);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didChange") && m.contains("never_opened.lua")),
+            "{logged:?}"
+        );
+    }
+
+    /// The guard's question is "has the client opened this?", not "does the
+    /// host hold text?". `bootstrap` indexes every `.lua` file under the
+    /// root, so `file_text` answers `Some(disk text)` for all of them — an
+    /// indexed file reaches #78 by the same route (a `didChange` with no
+    /// `didOpen`) and stays there: the invented overlay shadows disk, and
+    /// with no `didOpen` there is no `didClose` to drop it, so the errors
+    /// outlive the session's every attempt to correct them.
+    #[test]
+    fn a_ranged_did_change_for_an_indexed_but_unopened_document_is_dropped() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("indexed.lua");
+        fs::write(&path, "local x = 1\n").expect("write");
+        server.bootstrap();
+        // The index pass publishes for what it read; only what the
+        // `didChange` below produces is under test.
+        drain(&client);
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 },
+                        },
+                        "text": "((( ",
+                    }],
+                }),
+            })
+            .expect("a didChange for a document that was never opened is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "the index is not a buffer the client edits against: {messages:?}"
+        );
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local x = 1\n"),
+            "the indexed text must stay exactly as the walk read it"
+        );
+        let logged = log_messages_at(&messages, MessageType::WARNING);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didChange") && m.contains("indexed.lua")),
+            "{logged:?}"
+        );
+    }
+
+    /// #78: a file the walk found but `bootstrap` cannot read leaves the
+    /// index quietly incomplete — every cross-file answer that file would
+    /// have contributed to is silently wrong. `collect_lua_files` already
+    /// reports its own failure; this is the per-file half of the same rule.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_bootstrap_cannot_read_is_logged() {
+        let (dir, mut server, client) = test_server();
+        // A dangling symlink: the walk sees a `.lua` entry (it is not a
+        // directory), `read_to_string` then fails on the missing target.
+        std::os::unix::fs::symlink("nowhere.lua", dir.path().join("broken.lua")).expect("symlink");
+        server.bootstrap();
+
+        // The same read `bootstrap` just failed, so the assertion pins the
+        // OS error itself rather than a paraphrase of it: drop `{err}` from
+        // the format string and this test goes red.
+        let os_error = fs::read_to_string(dir.path().join("broken.lua"))
+            .expect_err("the symlink target does not exist")
+            .to_string();
+        // At WARNING, not LOG: a hole in the index makes later cross-file
+        // answers wrong, which is a complaint, not a trace line.
+        let logged = log_messages_at(&drain(&client), MessageType::WARNING);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("broken.lua") && m.contains(&os_error)),
+            "{logged:?} (expected the path and `{os_error}`)"
+        );
+    }
+
     /// The lint quick-fix *pairing*, not just its precondition.
     ///
     /// `code_actions` matches a fix back to the diagnostic that produced it
@@ -2858,7 +5576,7 @@ mod tests {
             );
         }
         let (server_end, _client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf(), false);
+        let server = Server::new(server_end, dir.path().to_path_buf(), false, TraceValue::Off);
         assert_eq!(
             server.rocks.types().len(),
             FILES,
@@ -2889,7 +5607,7 @@ mod tests {
             let root = dir.path().to_path_buf();
             let (server_end, client) = Connection::memory();
             let server = std::thread::spawn(move || {
-                let mut server = Server::new(server_end, root, true);
+                let mut server = Server::new(server_end, root, true, TraceValue::Off);
                 server.bootstrap();
                 server.main_loop()
             });
@@ -3184,7 +5902,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
         let (server_end, client) = Connection::memory();
-        let server = std::thread::spawn(move || drop(Server::new(server_end, root, true)));
+        let server =
+            std::thread::spawn(move || drop(Server::new(server_end, root, true, TraceValue::Off)));
 
         // Read up to the create request. A `$/progress` in this prefix would
         // be a token being used before it was asked for.
@@ -3275,7 +5994,7 @@ mod tests {
         let (server_end, client) = Connection::memory();
 
         let server = std::thread::spawn(move || {
-            let mut server = Server::new(server_end, root, true);
+            let mut server = Server::new(server_end, root, true, TraceValue::Off);
             server.main_loop()
         });
 
@@ -3407,7 +6126,7 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
-            let mut server = Server::new(server_end, root, true);
+            let mut server = Server::new(server_end, root, true, TraceValue::Off);
             let outcome = server.main_loop();
             let _ = done.send(());
             outcome
@@ -3437,7 +6156,7 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
-            let mut server = Server::new(server_end, root, true);
+            let mut server = Server::new(server_end, root, true, TraceValue::Off);
             let outcome = server.main_loop();
             let _ = done.send(());
             outcome
@@ -3531,7 +6250,7 @@ mod tests {
             false
         });
 
-        let mut server = Server::new(server_end, root, true);
+        let mut server = Server::new(server_end, root, true, TraceValue::Off);
         server.bootstrap();
         drop(server);
         assert!(

@@ -452,3 +452,40 @@ return w
 ";
     assert_eq!(strict_codes(src), Vec::<String>::new());
 }
+
+#[test]
+fn arg_count_message_pluralizes_by_count() {
+    // #58 check.rs audit: the `plural`/`was_were` helpers were the LB0301
+    // message's unpinned observables (6 surviving mutants between them).
+    // Two directions: 1-takes/2-supplied pins the singular parameter noun
+    // and "were"; 2-takes/1-supplied pins the plural noun and "was".
+    let one_takes_two_supplied = "\
+---@param n number
+local function f(n) end
+f(1, 2)
+";
+    let ds = check(one_takes_two_supplied, Strictness::Strict);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert!(
+        ds[0]
+            .message
+            .contains("takes 1 argument but 2 were supplied"),
+        "{}",
+        ds[0].message
+    );
+    let two_takes_one_supplied = "\
+---@param a number
+---@param b number
+local function g(a, b) end
+g(1)
+";
+    let ds = check(two_takes_one_supplied, Strictness::Strict);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert!(
+        ds[0]
+            .message
+            .contains("takes 2 arguments but 1 was supplied"),
+        "{}",
+        ds[0].message
+    );
+}

@@ -1,0 +1,151 @@
+# luals parity differential (#57): run lua-language-server over the corpus in
+# scripts/tests/luals-differential/ and compare both tools' verdicts against
+# the committed expectations. Merge-blocking: no continue-on-error — a parity
+# drift in either tool is a diff against a claim and fails the job.
+#
+# The luals version is PINNED (binary release, sha256-verified): the point of
+# the gate is that "matches luals" is measured against a named version, not
+# against whatever happened to be latest. Bumping the pin is a deliberate
+# change that re-measures every row (see the intentional-divergence rows in
+# expected.tsv for what may flip).
+name: luals-parity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # luabox-types and luabox-cli, plus every crate reachable by WALKING
+      # THE FULL GRAPH from luabox-cli's Cargo.toml [dependencies] — not
+      # just luabox-cli's direct deps: luabox-lsp (a direct dep, needed for
+      # `luabox lsp`) itself depends on luabox-db, so luabox-db is in this
+      # closure too even though `luabox check` never calls into it at
+      # runtime (only the `lsp` subcommand does, via luabox_lsp::run_stdio
+      # in lsp_cmd.rs) — a broken luabox-db is a broken `cargo build --bin
+      # luabox`, which fails this job's own build step before any verdict
+      # is measured, and a paths filter that can't see that source just
+      # times out or silently doesn't run. Parsing, lowering, diagnostics,
+      # lint, LSP, bundling and manifest resolution all sit upstream of the
+      # checker a generic-carrier `require` runs through. Nothing is
+      # excluded any more. Cargo.lock, the workspace Cargo.toml and
+      # rust-toolchain.toml are the pin `--locked` resolves against below —
+      # a dependency or toolchain bump moves every row's codes column
+      # exactly like a source change would, and needs the same trigger. A
+      # narrower filter lets a lowering, parse or dependency change merge
+      # with parity unmeasured, surfacing as drift on whatever unrelated
+      # luabox-types PR runs next. luals-differential-selftest.sh is listed
+      # explicitly, not just swept in by scripts/tests/luals-differential/**
+      # (a directory it sits next to but is not under): without its own
+      # entry, a PR touching only the self-test matches nothing here and
+      # starts neither job below — the `differential-selftest` job would
+      # exist but never run on the one class of change it exists to catch
+      # (R23/F25).
+      - "crates/luabox-types/**"
+      - "crates/luabox-cli/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-manifest/**"
+      - "crates/luabox-lint/**"
+      - "crates/luabox-lsp/**"
+      - "crates/luabox-lower/**"
+      - "crates/luabox-bundle/**"
+      - "crates/luabox-db/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/tests/luals-differential.sh"
+      - "scripts/tests/luals-differential-selftest.sh"
+      - "scripts/tests/luals-differential/**"
+      - ".github/workflows/luals-parity.yml"
+  pull_request:
+    paths:
+      # See the matching comment on the `push` trigger above — same
+      # closure, same reasoning, kept in sync deliberately (two triggers,
+      # one filter; see F4 in this repo's review history for what drift
+      # between two hand-maintained copies costs).
+      - "crates/luabox-types/**"
+      - "crates/luabox-cli/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-manifest/**"
+      - "crates/luabox-lint/**"
+      - "crates/luabox-lsp/**"
+      - "crates/luabox-lower/**"
+      - "crates/luabox-bundle/**"
+      - "crates/luabox-db/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/tests/luals-differential.sh"
+      - "scripts/tests/luals-differential-selftest.sh"
+      - "scripts/tests/luals-differential/**"
+      - ".github/workflows/luals-parity.yml"
+
+env:
+  LUALS_VERSION: "3.13.5"
+  LUALS_SHA256: "5d4316291b8c79b145002318fbb7cc294a327c314e2711e590609b178478eb59"
+
+jobs:
+  # The gate on the gate — same self-test discipline as this repo's other gates,
+  # for the same reason: R23/F25 found this driver's own self-test existed
+  # (14, now 22, non-vacuous cases) but nothing in CI ever ran it, so a PR
+  # that broke luals-differential-selftest.sh's judgement — or broke the
+  # driver logic a case pins, in a way only the self-test's stubbed-tool
+  # harness can see — merged silently. Both binaries this file drives are
+  # stubbed by the self-test itself (STUB-LUABOX-DIAG / STUB-LUALS-DIAG
+  # marker comments, no real typecheck or luals startup), so this job needs
+  # no Rust toolchain, no `cargo build`, and no pinned lua-language-server
+  # download — it is seconds, not the 30-minute budget below it.
+  differential-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test the luals-differential driver's judgement
+        run: bash scripts/tests/luals-differential-selftest.sh
+
+  luals-parity:
+    needs: differential-selftest
+    runs-on: ubuntu-latest
+    # This job builds luabox in release mode and then runs
+    # lua-language-server --check with its output suppressed
+    # (scripts/tests/luals-differential.sh) — a hang on either has no other
+    # signal, and this is merge-blocking, so it must not eat the 360-minute
+    # default before anyone learns anything.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install lua-language-server ${{ env.LUALS_VERSION }} (pinned)
+        run: |
+          # -f: a missing/renamed release asset (404 body, rc=0 without it)
+          # must fail here as a fetch error, not one line later as
+          # `sha256sum: FAILED` — which reads identically to "the pinned
+          # artifact was tampered with" on a security-shaped check and hides
+          # the actual fix (bump the pin). --retry survives a transient CDN
+          # blip instead of failing the merge-blocking job the same way.
+          curl -sSL -f --retry 3 -o luals.tar.gz \
+            "https://github.com/LuaLS/lua-language-server/releases/download/${LUALS_VERSION}/lua-language-server-${LUALS_VERSION}-linux-x64.tar.gz"
+          echo "${LUALS_SHA256}  luals.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/luals"
+          tar xzf luals.tar.gz -C "$HOME/luals"
+          "$HOME/luals/bin/lua-language-server" --version
+
+      - name: Build luabox (release)
+        run: cargo build --locked --release --bin luabox
+
+      - name: Run the parity differential
+        # LUALS_REQUIRED=1: the driver SKIPs (exit 0) when no luals binary is
+        # on PATH — a tolerable local convenience for a dev box without the
+        # tarball installed, but CI always installs it two steps above, so a
+        # SKIP here means the install step silently produced a binary that
+        # was not where LUALS pointed (tarball layout change, a dropped
+        # LUALS= prefix). Without this, that failure mode is a green job
+        # that measured none of the parity it exists to measure (F23).
+        run: LUALS="$HOME/luals/bin/lua-language-server" LUALS_REQUIRED=1 scripts/tests/luals-differential.sh

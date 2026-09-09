@@ -214,7 +214,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 - **Registry:** luarocks.org, bridged transparently by reading rockspecs statically (no `luarocks` CLI needed); `LUABOX_LUAROCKS_MIRROR` points resolution at a local mirror for hermetic/offline installs.
 - **Store:** global content-addressed cache (`~/.luabox/store`), hard-link/reflink into projects (bun/pnpm model).
 - Dep kinds: registry (rockspec), git (rev/tag/branch), url (http(s)/local tarball pinned by sha256, verified before extraction — bun-style), path, workspace.
-- **Dialect compatibility ([#5](https://github.com/flying-dice/luabox/issues/5)):** a package declares the dialects it is source-compatible with as an explicit **family set** — never a range (a range implies a total order LuaJIT breaks: it is 5.1-plus-extensions, not a point between 5.1 and 5.2). A registry rock's set is *translated* from its rockspec `lua` constraint (`lua >= 5.1, < 5.4` → `{5.1, 5.2, 5.3}`, plus `luajit` whenever `5.1` is admitted — LuaJIT is 5.1-family); a path/git package's set is its `luabox.toml` `[package] lua-versions`; an absent set is unconstrained (all dialects). At resolve time a dependency is usable for the project's **`[build] target`** (default `[package] edition`) when **either** the target is in the set, **or** the dependency's own edition is *lowerable* to the target — luabox owns the lowering pipeline and lowers dependency sources alongside the project's at build time (residual validation catches un-lowerable constructs as hard build errors). Otherwise resolution fails with a dedicated diagnostic (`LB1003` is reserved for it; the code is unallocated while the check is parked). Luau is inexpressible as a PUC dialect and has no lowering path, so a Luau package resolves only for a Luau target — the fence — until a real Luau→Lua lowering exists.
+- **Dialect compatibility (#5):** a package declares the dialects it is source-compatible with as an explicit **family set** — never a range (a range implies a total order LuaJIT breaks: it is 5.1-plus-extensions, not a point between 5.1 and 5.2). A registry rock's set is *translated* from its rockspec `lua` constraint (`lua >= 5.1, < 5.4` → `{5.1, 5.2, 5.3}`, plus `luajit` whenever `5.1` is admitted — LuaJIT is 5.1-family); a path/git package's set is its `luabox.toml` `[package] lua-versions`; an absent set is unconstrained (all dialects). At resolve time a dependency is usable for the project's **`[build] target`** (default `[package] edition`) when **either** the target is in the set, **or** the dependency's own edition is *lowerable* to the target — luabox owns the lowering pipeline and lowers dependency sources alongside the project's at build time (residual validation catches un-lowerable constructs as hard build errors). Otherwise resolution fails with a dedicated diagnostic (`LB1003` is reserved for it; the code is unallocated while the check is parked). Luau is inexpressible as a PUC dialect and has no lowering path, so a Luau package resolves only for a Luau target — the fence — until a real Luau→Lua lowering exists.
 - C modules: **declared, not built** — pure-Lua rocks only; a C/native rock is rejected with a clear error. Luabox is not a C build system.
 - **Publish:** `luabox publish` is a thin proxy that uploads the **authored** rockspec (the manifest you wrote) to luarocks.org — it compiles/generates nothing. It gates on a valid canonically-named rockspec (`package`/`version`/`source.url` present, filename `<package>-<version>.rockspec`), a green `luabox check`, and pure-Lua-only classification, then POSTs the rockspec to `luarocks.org/api/1/<key>/upload` (`--dry-run` previews without uploading). The API key comes from `luabox login --luarocks` (OS keychain) or `LUABOX_LUAROCKS_API_KEY`; consumers install the published rock with plain `luarocks install`.
 
@@ -250,7 +250,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 
 ## 11. Test runner & bench
 
-> **Removed (2026-07-15, [flying-dice/luabox#1](https://github.com/flying-dice/luabox/issues/1)).**
+> **Removed (2026-07-15, #1).**
 > luabox is a toolchain, not a runtime: most real Lua code is coupled to the
 > environment it deploys into (LÖVE, Neovim, OpenResty, an embedded VM), which
 > a bare-interpreter harness cannot faithfully execute. `luabox test` and
@@ -266,7 +266,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 ## 12. Toolchain manager (nvm/rustup analog)
 
 > **Removed (2026-07-26, [DIRECTION.md](../../DIRECTION.md#v1-scope-cut-accepted-2026-07-26),
-> [flying-dice/luabox#11](https://github.com/flying-dice/luabox/issues/11)).**
+> #11).**
 > `luabox toolchain` and `luabox run` are gone, and with them the built-in
 > runtime index, the luarocks provisioning, `luabox-toolchain.toml`, and the
 > generated `LUAROCKS_CONFIG`. **luabox acquires no runtime and spawns no

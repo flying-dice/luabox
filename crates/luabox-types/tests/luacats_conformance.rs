@@ -81,6 +81,43 @@ return Circle
 }
 
 #[test]
+fn a_re_declared_inherited_member_is_governed_by_its_own_declaration() {
+    // #107 (#58 mutation audit): a member the subclass re-declares is its
+    // own declaration's responsibility — here re-declared OPTIONAL, so the
+    // bare carrier owes nothing for it. Only the own-declaration exclusion
+    // separates this from the control below, which differs in exactly one
+    // respect (no re-declaration) and must still be obliged.
+    let src = "\
+---@class Tagged
+---@field tag string
+
+---@class Note : Tagged
+---@field tag? string
+local Note = {}
+
+return Note
+";
+    assert_eq!(plain_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn an_inherited_member_not_re_declared_stays_obliged() {
+    // One-variable control for the exclusion above.
+    let src = "\
+---@class Tagged
+---@field tag string
+
+---@class Note : Tagged
+local Note = {}
+
+return Note
+";
+    let diags = check_plain(src);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(diags[0].message.contains("tag"), "{}", diags[0].message);
+}
+
+#[test]
 fn class_conformance_complete_passes() {
     // A carrier providing every interface member with compatible signatures
     // is silent.

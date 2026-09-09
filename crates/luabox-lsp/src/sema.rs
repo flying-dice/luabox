@@ -10,17 +10,22 @@
 //! - types, docs, classes, and signatures come from the LuaCATS annotation
 //!   harvest — the same producer the typechecker reads.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use luabox_db::{Analysis, Annotations, LoweredHandle};
 use luabox_hir::{Binding, BindingId, Expr as HirExpr, HirId, Resolution};
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{SyntaxKind, SyntaxNode, SyntaxToken};
 use luabox_syntax::luacats::{
-    AnnotatedItem, ClassTag, FieldKey, FieldTag, FunParam, FunReturn, ParamTag, Tag, TypeExpr,
-    TypeExprKind,
+    AnnotatedItem, ClassTag, FieldKey, FieldTag, FunParam, FunReturn, ParamTag, Span, Tag,
+    TypeExpr, TypeExprKind,
 };
+use luabox_types::FieldOrigin;
 use rowan::{TextRange, TextSize, TokenAtOffset};
 
 use crate::line_index::LineIndex;
@@ -35,6 +40,90 @@ pub struct FileSema {
     pub root: SyntaxNode,
     annotations: Annotations,
     lowered: LoweredHandle,
+    /// How many times this file's class map has actually been derived — the
+    /// measurement surface behind [`Self::class_index`]'s memo (round 8
+    /// review, F23). Read by this module's own tests, which is why it is a
+    /// private field and not a public accessor: a reuse-count assertion is
+    /// the only thing that can tell a memo that is doing its job from one
+    /// that silently rebuilds, and the alternative — a `pub fn` nothing but
+    /// a test calls — is dead public surface on a semver-bound type.
+    ///
+    /// `#[cfg(test)]` (round 11 review): it is test-observability state, so a
+    /// production build carries neither the counter nor the increment. Safe
+    /// to gate — unlike the `merged_ambient` rebuild trace R26 refused to
+    /// gate, nothing outside this crate's own tests observes it, and what it
+    /// measures (an internal memo's build count) is not externally observable
+    /// behaviour that a release build could silently lose.
+    #[cfg(test)]
+    index_builds: Cell<usize>,
+    /// [`Self::class_index`]'s memo, built on first use and reused for this
+    /// `FileSema`'s lifetime — which [`FileSemaCache`] makes one revision
+    /// (round 8 review, F23).
+    class_index: RefCell<Option<Rc<ClassIndex>>>,
+}
+
+/// A file's `---@class` declarations located by **position** — the item and
+/// tag indices each declaration and its own `---@field` tags sit at — rather
+/// than by borrow (round 8 review, F23).
+///
+/// Positions are what make the memo possible. [`ClassDecl`] borrows the
+/// harvested tags out of the [`FileSema`] that owns them, so a map of
+/// `ClassDecl`s cannot be cached *inside* that same `FileSema` without a
+/// self-referential borrow; indices carry the identical information, own
+/// nothing, and re-resolve to the same borrows in O(1) whenever a caller
+/// actually needs one ([`FileSema::class_at`]).
+struct ClassIndex {
+    /// Class name → where it is declared.
+    sites: HashMap<String, ClassSite>,
+}
+
+/// One [`ClassIndex`] entry: the annotation item, the `---@class` tag's index
+/// within that item's tag list, and the indices of the `---@field` tags that
+/// attach to it.
+struct ClassSite {
+    item: usize,
+    tag: usize,
+    fields: Vec<usize>,
+}
+
+impl ClassIndex {
+    /// Harvest every `---@class` in `items`.
+    ///
+    /// The rule this encodes is the one [`FileSema::classes`] used to encode
+    /// inline, unchanged: a class tag opens a declaration, later `---@field`
+    /// tags *in the same annotation item* attach to the most recent one, and
+    /// a second declaration of the same name replaces the first outright (its
+    /// fields included). Both readers go through this one copy now, so the
+    /// memoised lookup and the enumerating one cannot drift on what a
+    /// duplicate name or a stray field means.
+    fn build(items: &[AnnotatedItem]) -> ClassIndex {
+        let mut sites: HashMap<String, ClassSite> = HashMap::new();
+        for (item_index, item) in items.iter().enumerate() {
+            let mut current: Option<&str> = None;
+            for (tag_index, tag) in item.block.tags.iter().enumerate() {
+                match tag {
+                    Tag::Class(c) if !c.name.is_empty() => {
+                        current = Some(&c.name);
+                        sites.insert(
+                            c.name.clone(),
+                            ClassSite {
+                                item: item_index,
+                                tag: tag_index,
+                                fields: Vec::new(),
+                            },
+                        );
+                    }
+                    Tag::Field(_) => {
+                        if let Some(site) = current.and_then(|name| sites.get_mut(name)) {
+                            site.fields.push(tag_index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ClassIndex { sites }
+    }
 }
 
 /// A `---@class` declaration harvested from the file.
@@ -100,6 +189,9 @@ impl FileSema {
             root,
             annotations,
             lowered,
+            #[cfg(test)]
+            index_builds: Cell::new(0),
+            class_index: RefCell::new(None),
         })
     }
 
@@ -225,56 +317,79 @@ impl FileSema {
 
     // === Annotations ======================================================
 
-    /// Every `---@class` in the file, by name.
-    #[must_use]
-    pub fn classes(&self) -> HashMap<&str, ClassDecl<'_>> {
-        let mut out = HashMap::new();
-        for item in self.items() {
-            let mut current: Option<&str> = None;
-            for tag in &item.block.tags {
-                match tag {
-                    Tag::Class(c) if !c.name.is_empty() => {
-                        current = Some(&c.name);
-                        out.insert(
-                            c.name.as_str(),
-                            ClassDecl {
-                                tag: c,
-                                fields: Vec::new(),
-                                docs: docs_of(item),
-                                sees: sees_of(item),
-                            },
-                        );
-                    }
-                    Tag::Field(f) => {
-                        if let Some(info) = current.and_then(|n| out.get_mut(n)) {
-                            info.fields.push(f);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    /// This file's [`ClassIndex`], derived once and reused (round 8 review,
+    /// F23).
+    ///
+    /// The derivation is a walk over every annotation item and every tag in
+    /// it; the map it used to build carried a fully-materialised
+    /// [`ClassDecl`] per class, joined doc lines and `---@see` list included.
+    /// [`locate_field`]'s DFS asks each candidate file for **one** class per
+    /// frame, so paying that whole-file derivation per frame made a
+    /// `MAX_ANCESTRY_DEPTH`-deep walk over `F` candidate files cost `F × 200`
+    /// derivations — on the single-threaded server, inside a hover.
+    fn class_index(&self) -> Rc<ClassIndex> {
+        if let Some(found) = self.class_index.borrow().as_ref() {
+            return Rc::clone(found);
         }
-        out
+        #[cfg(test)]
+        self.index_builds.set(self.index_builds.get() + 1);
+        let built = Rc::new(ClassIndex::build(self.items()));
+        *self.class_index.borrow_mut() = Some(Rc::clone(&built));
+        built
     }
 
-    /// The named fields of `class`, parents first (own fields override),
-    /// with a cycle guard. Returns `(field, declaring class)` pairs.
+    /// The [`ClassDecl`] at `site`, re-borrowed out of this file's harvested
+    /// items. `None` only if the index and the items disagree, which they
+    /// cannot: both come from the same `annotations` handle, and neither is
+    /// mutable after construction.
+    fn class_at(&self, site: &ClassSite) -> Option<ClassDecl<'_>> {
+        let item = self.items().get(site.item)?;
+        let Some(Tag::Class(tag)) = item.block.tags.get(site.tag) else {
+            return None;
+        };
+        let fields = site
+            .fields
+            .iter()
+            .filter_map(|index| match item.block.tags.get(*index) {
+                Some(Tag::Field(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        Some(ClassDecl {
+            tag,
+            fields,
+            docs: docs_of(item),
+            sees: sees_of(item),
+        })
+    }
+
+    /// The file's `---@class` declaration of `name`, if it has one — the
+    /// single-class lookup [`locate_field`]'s per-frame question actually is,
+    /// answered off the memoised index instead of by rebuilding the whole
+    /// map (round 8 review, F23).
     #[must_use]
-    pub fn class_fields(&self, class: &str) -> Vec<(&FieldTag, String)> {
-        let classes = self.classes();
-        let mut seen = HashSet::new();
-        let mut by_name: Vec<(String, (&FieldTag, String))> = Vec::new();
-        collect_fields(&classes, class, &mut seen, &mut by_name);
-        let mut merged: Vec<(&FieldTag, String)> = Vec::new();
-        let mut names = HashSet::new();
-        // Later entries (own fields) override earlier (inherited) ones.
-        for (name, entry) in by_name.into_iter().rev() {
-            if names.insert(name) {
-                merged.push(entry);
-            }
-        }
-        merged.reverse();
-        merged
+    pub fn class_named(&self, name: &str) -> Option<ClassDecl<'_>> {
+        let index = self.class_index();
+        let site = index.sites.get(name)?;
+        self.class_at(site)
+    }
+
+    /// Every `---@class` in the file, by name — for the surfaces that
+    /// genuinely enumerate ([`crate::symbols`], [`crate::references`],
+    /// [`crate::goto_implementation`]). Materialised from the same memoised
+    /// index [`Self::class_named`] reads, so the two cannot disagree about
+    /// what this file declares.
+    #[must_use]
+    pub fn classes(&self) -> HashMap<&str, ClassDecl<'_>> {
+        let index = self.class_index();
+        index
+            .sites
+            .values()
+            .filter_map(|site| {
+                let decl = self.class_at(site)?;
+                Some((decl.tag.name.as_str(), decl))
+            })
+            .collect()
     }
 
     /// The annotation item whose target statement contains `range`
@@ -384,21 +499,23 @@ impl FileSema {
         None
     }
 
-    /// The class name a binding's annotated type resolves to, if the type is
-    /// a declared `---@class` (peeling `?` and parentheses).
+    /// The receiver's annotated type, arguments included (#48):
+    /// `---@type Box<number>` answers the whole `Box<number>` reference, not
+    /// just `Box`, so a caller can hand it to
+    /// [`luabox_types::Ambient::class_members_of`] and get `item: number`
+    /// rather than the free `T` a bare-name lookup leaves it as. Peels `?`
+    /// and parentheses. Resolved against the merged workspace ambient by the
+    /// caller ([`crate::requires::receiver_type`], #56), not against this
+    /// file's own `---@class` declarations — classes are workspace-global,
+    /// so requiring this file to declare the name too would miss exactly
+    /// the cross-file receiver #46/#47 fixed. `None` for no annotation, or
+    /// one that — after peeling — is not a `Named` reference at all (a
+    /// union, an array, ...): the same boundary `class_members_of` itself
+    /// enforces, kept here so a caller cannot construct a `TypeExpr` it
+    /// would reject anyway.
     #[must_use]
-    pub fn class_of_binding(&self, binding: &Binding) -> Option<String> {
-        let ty = self.binding_type(binding)?;
-        let name = named_of(&ty)?;
-        self.classes().contains_key(name.as_str()).then_some(name)
-    }
-
-    /// [`Self::class_of_binding`] for the nearest binding named `name`
-    /// visible at `offset`.
-    #[must_use]
-    pub fn class_of_name(&self, name: &str, offset: usize) -> Option<String> {
-        let binding = self.visible_binding_named(name, offset)?;
-        self.class_of_binding(binding)
+    pub fn annotated_type(&self, binding: &Binding) -> Option<TypeExpr> {
+        peel_to_named(self.binding_type(binding)?)
     }
 
     /// Which of the target `local` statement's names this binding is
@@ -547,31 +664,741 @@ fn contains(range: TextRange, offset: usize) -> bool {
     start <= offset && offset <= end && !(offset == end && start == end)
 }
 
-fn collect_fields<'a>(
-    classes: &HashMap<&str, ClassDecl<'a>>,
-    name: &str,
-    seen: &mut HashSet<String>,
-    out: &mut Vec<(String, (&'a FieldTag, String))>,
-) {
-    if !seen.insert(name.to_string()) {
-        return;
+/// Whether `name` names an `---@alias` or `---@enum` declared anywhere in
+/// the project — both are workspace-global, exactly like a class (M20,
+/// round 6 review): `requires::require_struct_fields`'s gate must block the
+/// `require`d module's raw structural export whenever an explicit
+/// `---@type` annotation names *anything* real, not only a class.
+/// `Ambient::class_members_of` (via [`crate::merged_ambient::MergedAmbient`])
+/// already answers "is this a class that resolves", but has no counterpart
+/// for an alias — and nothing public in `luabox-types` exposes
+/// `TypeEnv::resolve_named`/`lower_bound_args`'s alias expansion from
+/// outside that crate (round 6 report: the accessor this would need to
+/// follow the alias through to what it expands to, rather than merely
+/// confirm it is declared).
+///
+/// This existence check is the best available substitute without that
+/// accessor: it cannot tell what the alias/enum expands to, only that the
+/// name is real, which is enough to stop a genuine annotation from being
+/// mistaken for one that resolves to nothing and falling back to the
+/// `require`d module's plain table shape — the confidently-wrong answer M20
+/// reported (`(field) mod.x: 42` where the alias's real type is `string`).
+///
+/// Unbounded and uncached by itself — `analysis.files().any(...)` scans
+/// every project file's every annotation's every tag on each call (H2).
+/// Every production call site goes through
+/// [`crate::merged_ambient::MergedAmbient::is_declared_alias_or_enum`]
+/// instead, which memoises the answer per name for the revision's lifetime,
+/// exactly the way [`crate::merged_ambient::MergedAmbient::class_members`]
+/// memoises `Ambient::class_members`; call this bare function directly only
+/// from a test or another cache's own miss path.
+#[must_use]
+pub fn is_declared_alias_or_enum(analysis: &Analysis, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
     }
-    let Some(info) = classes.get(name) else {
-        return;
+    analysis.files().any(|path| {
+        analysis.annotations(path).is_some_and(|annotations| {
+            annotations.items().iter().any(|item| {
+                item.block.tags.iter().any(|tag| match tag {
+                    Tag::Alias(a) => a.name == name,
+                    Tag::Enum(e) => e.name == name,
+                    _ => false,
+                })
+            })
+        })
+    })
+}
+
+/// Where a `class`'s `member` field is textually declared: the file, its
+/// `---@field` description, and the tag's span in that file.
+pub struct FieldSource {
+    pub path: PathBuf,
+    pub desc: Option<String>,
+    pub span: Span,
+}
+
+/// The invariants of one field lookup: everything [`locate_field`] carries
+/// unchanged from frame to frame, so the walk itself threads only what
+/// actually varies (the class, the member, the depth-carrying visited map,
+/// the depth).
+///
+/// One bag rather than a parameter list because the three production callers
+/// (hover, goto-definition, signature help) all fill it from the same
+/// [`crate::merged_ambient::MergedAmbient`] and thread it unchanged through
+/// the recursion. Deliberately holds **only** the search infrastructure: what
+/// is being looked up — the class, the member, and the merge's own answer for
+/// them ([`locate_field`]'s `origin`, #70) — varies per query and is passed
+/// alongside, not folded in here.
+pub struct FieldLookup<'a> {
+    pub analysis: &'a Analysis,
+    /// The file the query is asked *from* — the cursor's own.
+    pub current: &'a Path,
+    /// The genuinely `[types] defs`-configured paths (N18).
+    pub ambient_paths: &'a HashSet<PathBuf>,
+    pub sema_cache: &'a FileSemaCache,
+    pub search_order_cache: &'a SearchOrderCache,
+}
+
+/// [`FieldSource`] for `class.member`, searched across every project file's
+/// own `---@class` annotations, walking the parent chain **across files**
+/// (#51, #54) — the cross-file counterpart of [`collect_fields`], which can
+/// only walk a parent declared in the same file it started from (the exact
+/// shape #46/#47 fixed for existence; this is its declaration-site half).
+///
+/// Used only to *enrich* a member already confirmed to exist by
+/// [`luabox_types::Ambient::class_members`] — a description for hover
+/// (#51), a jump target for goto-definition (#54) — never to decide whether
+/// it exists: `luabox_types::env::collect_class`'s merge (defs winning a
+/// same-name collision, generic substitution, ...) is the authority on that,
+/// and reimplementing it here would be a second copy of the merge rule (#59
+/// exists to prevent exactly that shape). `None` when no project file
+/// declares `class` or an ancestor of it with that field — a class built
+/// entirely from carrier-attached `function C:method`s, with no `---@field`
+/// anywhere in its chain, has nothing here to find; that is a real,
+/// documented gap, not a bug (#51 only pins the loss for a field an
+/// `---@field` tag actually declares).
+///
+/// `current` is the file the query is being asked *from* (the cursor's own
+/// file) — checked first *for the common case*, and every other file is
+/// visited lazily, one `FileSema` at a time, only as the parent-chain walk
+/// actually needs it (round 4 review R10): the previous version built a
+/// `FileSema` — a full byte scan (`LineIndex::new`) and a `classes()` walk —
+/// for *every* project file before looking at a single candidate, even when
+/// `class` was declared in `current` itself. Measured release (this crate's
+/// own N-filler-files repro, member hover, single-digit-line filler files,
+/// zero `.d.lua` files present): 33µs → 252µs → 1.29ms at N = 10/100/500
+/// before this fix, 6µs → 55µs → 380µs after — a 5–7× cut, not flat:
+/// [`search_order`] still walks [`Analysis::files`] once per
+/// collision-priority group to classify defs vs. project paths (R11 needs
+/// that ordering *before* trusting `current` alone), so the residual cost is
+/// O(files) in cheap path-suffix comparisons and a sort, not O(files) in
+/// full parses.
+///
+/// That R10 measurement never exercised a `[types] defs` project (zero
+/// `.d.lua` filler files), so it never caught this: `search_order` put every
+/// `*.d.lua` file ahead of `current` in the *visit* order too, not just the
+/// priority order, and the loop below builds a full `FileSema` for each path
+/// it visits in turn — so a project with defs configured paid a full parse
+/// of every defs file before ever reaching `current`, on every hover, even
+/// when `class` is declared in `current` and nowhere in `defs`. Re-measured
+/// (release, same repro, same member-hover shape) with 10 filler `.d.lua`
+/// files held constant across the sweep — none of them declaring the queried
+/// class, a modest but realistic vendored-defs package — while N project
+/// filler files still scales 10/100/500: 23µs → 78µs → 358µs before this fix,
+/// 8µs → 67µs → 327µs after (both medians of 50 runs against one built
+/// `Analysis`, two independent runs, single-digit-percent run-to-run
+/// variance). The cut is largest at N = 10 (roughly 2.7×) and shrinks as N
+/// grows, because the 10-file defs tier this fix skips is a fixed cost that
+/// becomes a smaller fraction of a total dominated by the (unfiltered) `rest`
+/// tier as project-file count grows — expected, since this fix targets only
+/// the defs tier, not `rest`. [`search_order`] now takes `class` and skips a
+/// defs file's `FileSema` build entirely when the file's raw text cannot
+/// possibly hold a `---@class class` tag ([`may_declare_class`] below — a
+/// cheap, false-positive-safe substring scan over the text
+/// [`luabox_db::Analysis::file_text`] already has cached, not a second
+/// parse).
+///
+/// Visit order among **project files** — the only universe this function
+/// (and [`Analysis::files`]/[`Analysis::file_text`] generally) ever sees —
+/// otherwise follows the type merge's own authority: whichever file loads
+/// first at workspace bootstrap wins a same-name collision
+/// (`luabox_types::env::TypeEnv::merge_file_types`, called once per project
+/// file in `Project::files(db)` order, keeps the first-seen declaration on a
+/// collision), proven end-to-end by `server.rs`'s
+/// `a_first_declared_ordinary_project_file_wins_a_same_name_collision_over_a_later_one`.
+/// `server.rs::bootstrap` loads files in
+/// `luabox_manifest::layout::collect_lua_files`'s walk order — sorted by
+/// filename within each directory, always descending fully before advancing
+/// to the next sibling — which is exactly the order `Path`'s own `Ord`
+/// (component-wise lexicographic) produces over the full paths, i.e. exactly
+/// what `rest.sort_unstable()` below produces, and that's also the order
+/// `Project::files(db)` receives its entries in (`host.rs`'s `sync_file`
+/// appends each new file to that `Vec` the first time bootstrap syncs it),
+/// which is the order `merge_file_types` reads first-wins from. The one gap
+/// this does not close: a file created and `didOpen`'d only *after*
+/// bootstrap — never seen by the initial workspace walk — is appended to
+/// `Project::files(db)` in `didOpen` order, not resorted, so its position in
+/// the merge's first-wins order can disagree with this alphabetical
+/// tiebreak. Closing that would need `luabox_db::Analysis` to expose
+/// `Project::files(db)`'s actual `Vec` order (today `Analysis::files` erases
+/// it through a `HashMap`) — a `luabox-db` change, outside this crate.
+///
+/// **A `*.d.lua`-named file gets no special priority *by naming alone***
+/// (N18: an earlier version of this doc claimed the naming convention itself
+/// was the authority, and was wrong). `merge_file_types` — the ordinary-file
+/// authority the paragraph above measures against — has no notion of the
+/// `.d.lua` suffix at all: `luabox_manifest::layout::is_def_file` is checked
+/// nowhere in `luabox-types` or `luabox-db`. The file merge's *actual*
+/// second source of elevated precedence is a genuinely-configured
+/// `[types] defs = [...]` entry, which is a wholly separate parse
+/// ([`luabox_types::Ambient`], built by `server.rs`'s `build_ambient` from
+/// `luabox_manifest::layout::resolve_project_defs`) combined with the
+/// ordinary project-file merge only later, at
+/// [`crate::merged_ambient::MergedAmbient::build`]. `ambient_paths` is how
+/// *this* function is told which paths that separate parse actually covers —
+/// `server.rs` computes it alongside `base` itself (from the same
+/// `resolve_project_defs` labels, so the two can never disagree) and it is
+/// the only thing this function trusts for elevated precedence: a path in
+/// the set is visited ahead of `rest` (matching the ambient layer really
+/// winning the type collision too); a `.d.lua`-suffixed file *not* in the
+/// set — because `[types] defs]` never named it — is exactly as ordinary a
+/// project file as any `.lua` one, filtered and ordered identically. Before
+/// this fix, naming alone stood in for the set, so an unconfigured
+/// `.d.lua`-named file got the elevated precedence anyway: the type resolved
+/// through whichever file the merge actually preferred, while hover's
+/// *description* and goto-definition both named the `.d.lua` file instead —
+/// three surfaces disagreeing about one collision (`server.rs`'s
+/// `a_def_named_file_with_no_types_defs_config_is_an_ordinary_project_file_for_collisions`
+/// pins the corrected, single-answer behaviour; the genuinely-configured case
+/// stays pinned by `a_defs_declaration_wins_a_same_name_collision_over_a_project_files_own`).
+/// [`may_declare_class`]'s scan (a *superset* filter — word-boundary
+/// substring match, no false negatives) is applied uniformly to every
+/// non-`current` file, ambient or not (N21: it used to apply only to the
+/// `.d.lua`-named tier, leaving the — typically much larger — rest of the
+/// project unfiltered, even though the doc's own no-false-negative argument
+/// never depended on the `.d.lua` suffix).
+///
+/// **Two separate orderings are in play here, and only one of them is what
+/// the paragraphs above describe** (round 6 review M2): everything above is
+/// about *file*-visit order for **one** class name — which file wins when
+/// more than one project file declares the same name. It says nothing about
+/// *parent-chain* order — the order distinct class names are visited in —
+/// which is the axis round 6's precedence flip actually changed and this
+/// function used to get wrong: it queued every parent **breadth-first**
+/// (`class`, then all its immediate parents, then all of *their* parents,
+/// ...) while `luabox_types::env::TypeEnv::collect_class` — the checker's
+/// own authority for the same merge — resolves **depth-first preorder**
+/// (a class's own declaration, then its first-listed parent's *entire*
+/// subtree, then its second-listed parent's, ...). For `C : A, B` with
+/// `A : X` and both `X` and `B` declaring the same field, BFS visits `X`
+/// and `B` in the same generation and (depending on queue order) could
+/// return either; DFS preorder always reaches `X` — `A`'s own subtree —
+/// before `B`, agreeing with `collect_class`. [`locate_field_dfs`] now
+/// walks depth-first preorder for exactly this reason, so hover's type
+/// (resolved through `collect_class` via
+/// [`crate::merged_ambient::MergedAmbient::class_members_of`]), its
+/// description, and goto-definition's target agree on the common,
+/// non-diamond case this fixes.
+///
+/// **Two shapes the walk above cannot reach at all, and `origin` is how
+/// they are answered instead** (#70). Traversal order fixes the *common*
+/// disagreement; it cannot fix these, because the answer is not a function
+/// of the order this walk visits things in:
+///
+/// - A genuine *diamond* conflict — the same generic ancestor reached
+///   through two parents bound to different type arguments, where
+///   `collect_class` keeps the **last**-visited edge rather than the first.
+/// - A class whose own field declarations are split across more than one
+///   file, where the winner is per-*field*, not per-file: `search_order`
+///   hoists `current` ahead of the other ordinary project files (the R10
+///   shortcut), while `merge_file_types` takes the first declarer in
+///   `Project::files(db)` order regardless of which file the cursor is in.
+///
+/// `origin` is [`luabox_types::Ambient::class_field_origins`]' answer for
+/// this member — `collect_class`'s **own** per-key winner, produced by the
+/// same walk that resolved the type, not re-derived alongside it. Given one:
+/// a recorded [`luabox_types::FieldDeclSite`] *is* the answer, returned
+/// directly with no file visited at all; an owner with no recorded site
+/// (`FieldDeclSite` lists those cases — chiefly a carrier attachment or the
+/// definition layer) **roots the walk at that class** instead of at the one
+/// the cursor named, so a same-named declaration on a branch the owner
+/// cannot reach is never visited. `None` — a class the merged layer does not
+/// declare, or a caller with no merged layer to ask — walks from the queried
+/// class, unchanged.
+///
+/// That narrowing is a **sibling filter**: it drops exactly the classes
+/// reachable from the queried class and *not* from the owner, which
+/// contributed nothing to this key — their same-named `---@field` is a name
+/// collision the merge resolved, not a declaration of the member it
+/// resolved. The owner's **own** ancestry stays reachable whatever type it
+/// declares, because that chain is the member's override lineage and
+/// [`luabox_types::assignable`] deliberately admits an override at an
+/// incompatible type (luals 3.13.5 nominal parity): a type test here would
+/// hide documentation for a shape `luabox check` calls legal.
+///
+/// Two shapes one edge apart draw the line, both pinned at all three editor
+/// surfaces (round 10 review). `Mid` attaches `f` as a carrier and wins the
+/// key; `Other` declares `---@field f string`:
+///
+/// - `Leaf : Mid, Other` — `Other` is off the owner's ancestry, so it is
+///   **filtered** and nothing is shown
+///   (`locate_field_roots_the_walk_at_the_owner_not_the_queried_class`).
+/// - `Leaf : Mid`, `Mid : Other` — `Other` is the lineage's earlier link, so
+///   it is **kept**: its description and jump target are shown under the
+///   carrier's type
+///   (`locate_field_keeps_a_ruled_out_declaration_on_the_owners_own_ancestry`).
+///
+/// The first is why this decides *whether* a declaration is shown and not
+/// only which one — it answers `None` where the unrooted walk answered with
+/// the sibling, which is the point: a `string` field's prose under a `fun()`
+/// type is the divergence #70 closes.
+#[must_use]
+pub fn locate_field(
+    lookup: &FieldLookup<'_>,
+    class: &str,
+    member: &str,
+    origin: Option<&FieldOrigin>,
+) -> Option<FieldSource> {
+    // The merge already recorded where this key was declared: no walk of any
+    // kind can improve on that, and every walk that disagrees with it is
+    // wrong by construction.
+    //
+    // The recorded path is checked against this `Analysis` before it is
+    // returned (round 8 clean-code audit, coupling finding 1), and an
+    // unresolvable one falls through to the owner-rooted walk below, exactly
+    // as an owner with no site at all does. `luabox_types::FieldDeclSite::file`
+    // is a `String` `luabox-db` produced with `Path::to_string_lossy` for
+    // *diagnostic* display; nothing in the type system says a `PathBuf` built
+    // back out of it names a file this snapshot knows, and a non-UTF-8 path
+    // round-trips through U+FFFD to one that does not. Every site the merge
+    // records comes from a project file, so this rejects nothing in practice
+    // — it is what stops "in practice" from being the only thing holding a
+    // goto-definition target together.
+    if let Some(site) = origin.and_then(|origin| origin.site.as_ref()) {
+        let path = PathBuf::from(&site.file);
+        if lookup.analysis.files().any(|known| known == path) {
+            return Some(FieldSource {
+                path,
+                desc: site.desc.clone(),
+                span: Span {
+                    start: site.span.start,
+                    end: site.span.end,
+                },
+            });
+        }
+    }
+    // Owner known, site not (or recorded but unresolvable). All the merge's
+    // answer buys here is a better **root** for the same walk: start at the
+    // class it resolved the key to rather than at the class the cursor named,
+    // so a branch it ruled out is never entered.
+    //
+    // What that drops is the owner's *siblings*, and only those — this
+    // function's doc states the rule and names the two one-edge-apart
+    // fixtures that pin each side of it (round 10 review).
+    //
+    // The walk's own two-pass shape supplies the ordering within the lineage.
+    // `locate_field_in_class` exhausts a class's own `---@field`s across every
+    // candidate file before it follows a single parent, so the nearest link
+    // wins — the owner's own declaration over the ancestor it overrides.
+    // Asking for the owner's own declarations separately first and falling
+    // back to the walk on a miss was the same thing said twice — it rebuilt
+    // the owner's declaration set a second time on exactly the case
+    // (`function S.greet()` carriers) the walk's own doc calls routine (round
+    // 9 clean-code audit, DRY finding 1).
+    //
+    // Stopping at that first pass instead — answering a miss with `None` —
+    // was a silent revert (round 9 review, thread on `sema.rs:952`). A
+    // carrier attachment declares the member with no `---@field` anywhere in
+    // the owner, so the parent's is the only description and the only jump
+    // target that exist, and the type rendered comes from the carrier either
+    // way.
+    let root = origin.map_or(class, |origin| origin.owner.as_str());
+    locate_field_dfs(lookup, root, member, &mut HashMap::new(), 0)
+}
+
+/// [`locate_field`]'s depth-first preorder walk over the parent chain (M2),
+/// bounded by [`luabox_types::MAX_ANCESTRY_DEPTH`] (M45, round 6 review): a
+/// pathological chain the checker itself refuses to resolve past that depth
+/// must not send this walk recursing past it either — an LSP field lookup
+/// with no bound at all would keep walking a 10 000-class chain the checker
+/// already gave up on at 200.
+///
+/// `visited` is never unwound on the way back out (production readiness
+/// review, finding 1). The M2 rewrite that made this walk depth-first
+/// replaced the previous BFS's once-ever `seen` set with a path-scoped guard
+/// that *was* unwound per frame, so a class reachable through two parents was
+/// re-expanded once per distinct path to it rather than once per node: on the
+/// repo's own `conflicting_diamond_source` shape (`A{i} : A{i-1}<T>,
+/// A{i-1}<number>` — both parents naming the same class) that is 2^k node
+/// visits, and the depth cap above never fires because a wide-shallow
+/// lattice's *depth* stays small. A **miss** is the case that pays it in
+/// full, and misses are routine here: [`FileSema::classes`] harvests only
+/// `---@field` tags, so every `function C:method()` carrier member is a miss
+/// ([`crate::goto_definition`] and [`crate::signature_help`] both call in for
+/// any member name once the class has an indexer or array part). The server
+/// is single-threaded with no request cancellation, so one such miss stalls
+/// every other request, shutdown included.
+///
+/// # Why the entry carries the depth it was inserted at (round 8 review, F2)
+///
+/// It used to be a once-ever *set*, on the argument that a re-reached class
+/// "can only ever have returned `None` the first time, and would return
+/// `None` again, since its answer depends on nothing that varies between
+/// frames". `depth` varies between frames, and `depth` gates the recursion
+/// one line below — so that argument was false for exactly the class whose
+/// **first** reach was near the cap. `Y` first expanded at
+/// `MAX_ANCESTRY_DEPTH - 1` pushes its own parents at `MAX_ANCESTRY_DEPTH`,
+/// where they are dropped: `Y` is marked visited with its subtree
+/// unexplored. A later *shallow* reach of `Y` — where those parents are well
+/// inside the cap — hit the set and returned `None`, so a member declared
+/// above `Y` had no hover, no goto-definition and no signature-help target.
+/// Which of the two reaches happens first is decided by the order `Y`'s
+/// child lists its parents (`A : B1, Y` loses it, `A : Y, B1` finds it), so
+/// the same class graph answered two ways.
+///
+/// The entry now records the depth the class was expanded at, and a re-reach
+/// at a **strictly shallower** depth re-expands it. That is depth relaxation
+/// (Bellman-Ford's, run eagerly by the DFS rather than in rounds): every
+/// expansion of a node at depth `d` offers its parents `d + 1`, and a parent
+/// holding a larger recorded depth takes the improvement and re-expands. A
+/// node's recorded depth only ever falls, and it is bounded below by 0 and
+/// above by `MAX_ANCESTRY_DEPTH`, so each node is expanded at most
+/// `MAX_ANCESTRY_DEPTH` times: **O(V·D)**, not the exponential per-path walk
+/// finding 1 removed, and the `k = 25` bounded-time diamond test above it
+/// stays green (a chain-first DFS reaches every `A{i}` at its minimal depth
+/// on the first pass, so nothing relaxes and the walk is still `k + 1`
+/// expansions).
+///
+/// **The winner is stable under this, and *more* stable than before.**
+/// Relaxation converges to `reach(n)` — the minimum, over every path from
+/// the queried class to `n`, of that path's length — so the set of expanded
+/// classes is exactly `{ n : reach(n) < MAX_ANCESTRY_DEPTH }`, a property of
+/// the class graph alone. Parent order no longer decides *which* classes get
+/// expanded, only the order they are expanded in; the previous set made
+/// membership depend on which reach happened to land first. Within that set
+/// the search is unchanged: it is first-match, returning the instant a
+/// candidate declares `member`, so the winner is the earliest class in the
+/// preorder M2 established (own declarations across every candidate file,
+/// then each listed parent's entire subtree in order) that declares it. A
+/// re-expansion can only *add* classes to that preorder — never reorder the
+/// prefix already walked — so it changes the answer only where the old walk
+/// returned a later declaration, or none at all, because an earlier one had
+/// been poisoned. The map still subsumes the cycle guard: a true cycle
+/// (`A : B`, `B : A`) re-reaches each node at a strictly *greater* depth
+/// every time round, which is refused, so it terminates on the first lap.
+fn locate_field_dfs(
+    lookup: &FieldLookup<'_>,
+    class: &str,
+    member: &str,
+    visited: &mut HashMap<String, usize>,
+    depth: usize,
+) -> Option<FieldSource> {
+    if depth >= luabox_types::MAX_ANCESTRY_DEPTH {
+        return None;
+    }
+    match visited.get(class) {
+        // Already expanded from at least this close: its subtree was walked
+        // with a cut no tighter than the one this frame would apply, so
+        // re-expanding it cannot reach anything new.
+        Some(&seen) if seen <= depth => return None,
+        _ => visited.insert(class.to_string(), depth),
     };
-    for parent in &info.tag.parents {
-        if let Some(parent_name) = match &parent.kind {
-            TypeExprKind::Named { name, .. } => Some(name.clone()),
-            _ => None,
-        } {
-            collect_fields(classes, &parent_name, seen, out);
+    locate_field_in_class(lookup, class, member, visited, depth)
+}
+
+/// [`locate_field_dfs`]'s per-class body, two passes: `class`'s own
+/// `---@field` declaration wins over *any* parent's, across every candidate
+/// file in [`search_order`]'s order — matching `absorb_block`/
+/// `merge_file_types`'s own-declaration union running to completion before
+/// `collect_class` ever looks at a parent — and only once no candidate file
+/// declares the field itself does the second pass recurse into each
+/// candidate's parents, depth-first, file order then listed-parent order.
+///
+/// Both passes read one `declarations` list built up front rather than
+/// re-deriving it per pass (production readiness review, finding 7):
+/// [`FileSema::classes`] walks every annotation item in a file and allocates
+/// a fresh `HashMap` of *every* class it declares, so calling it once per
+/// pass paid that whole-file build twice for each candidate file, on every
+/// class in the ancestry walk. Collecting first changes nothing about the
+/// two-pass precedence — the same candidate files in the same
+/// [`search_order`] order, own-declarations exhausted before any parent is
+/// followed.
+fn locate_field_in_class(
+    lookup: &FieldLookup<'_>,
+    class: &str,
+    member: &str,
+    visited: &mut HashMap<String, usize>,
+    depth: usize,
+) -> Option<FieldSource> {
+    scan_class_declarations(lookup, class, |declarations| {
+        if let Some(found) = own_field_source(declarations, member) {
+            return Some(found);
+        }
+        for (_, decl) in declarations {
+            for parent in &decl.tag.parents {
+                let Some(parent_name) = named_of(parent) else {
+                    continue;
+                };
+                if let Some(found) =
+                    locate_field_dfs(lookup, &parent_name, member, visited, depth + 1)
+                {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Every candidate file's own `---@class class` declaration, in
+/// [`search_order`]'s order, built once and handed to `body` — the shape
+/// production readiness review finding 7 asks for (each candidate's
+/// `FileSema` and `ClassDecl` are built one time, not once per pass), phrased
+/// as a callback because the declarations borrow the `FileSema`s that back
+/// them and so cannot outlive the call that owns them.
+fn scan_class_declarations<R>(
+    lookup: &FieldLookup<'_>,
+    class: &str,
+    body: impl FnOnce(&[(&FileSema, ClassDecl<'_>)]) -> R,
+) -> R {
+    let order = search_order(
+        lookup.analysis,
+        lookup.current,
+        class,
+        lookup.ambient_paths,
+        lookup.search_order_cache,
+    );
+    let semas: Vec<Rc<FileSema>> = order
+        .iter()
+        .filter_map(|path| cached_file_sema(lookup.sema_cache, lookup.analysis, path))
+        .collect();
+    let declarations: Vec<(&FileSema, ClassDecl<'_>)> = semas
+        .iter()
+        .filter_map(|sema| sema.class_named(class).map(|decl| (&**sema, decl)))
+        .collect();
+    body(&declarations)
+}
+
+/// The first candidate file that declares `member` as one of the class's
+/// **own** `---@field`s, in [`search_order`]'s order.
+fn own_field_source(
+    declarations: &[(&FileSema, ClassDecl<'_>)],
+    member: &str,
+) -> Option<FieldSource> {
+    declarations.iter().find_map(|(sema, decl)| {
+        decl.fields
+            .iter()
+            .find(|f| matches!(&f.key, FieldKey::Name(n) if n == member))
+            .map(|field| FieldSource {
+                path: sema.path.clone(),
+                desc: field.desc.clone(),
+                span: field.span,
+            })
+    })
+}
+
+/// The declared `<T, U, ...>` type-parameter names of `class`'s own
+/// `---@class` declaration, searched across every project file the same way
+/// [`locate_field`] does (M21, round 6 review) — used only to tell whether a
+/// resolved field's type is a bare reference's own **unbound** parameter
+/// (`Box.item: T` for `---@type Box`, no `<...>` arguments), which
+/// `luabox check` renders `unknown` through
+/// `TypeEnv::class_shape_bound_export`'s erasure (`hover.rs`'s member route
+/// used to skip that erasure entirely and leak the literal parameter name).
+///
+/// That erasing path is `pub(crate)` in `luabox-types`, with no
+/// `Ambient`-level counterpart reachable from this crate (round 6 report:
+/// the accessor this would need — an `Ambient::class_members_of_export` or
+/// similar, mirroring [`Self::class_own_params`]'s sibling
+/// `Ambient::class_members_of` but calling the export/erasing variant),
+/// so hover approximates the erasure here instead of reaching for it: only
+/// the *directly*-referenced class's own literal parameters are recognised
+/// — a free parameter inherited from a deeper, differently-named ancestor
+/// parameter (propagated through the substitution chain `collect_class`
+/// itself performs across the whole parent chain) is not, and still renders
+/// as its literal ancestor-parameter name. Narrower than the checker's own
+/// erasure, but correct for the common, single-level generic shape the
+/// round 6 repro and `hover-require.feature`'s own scenario both use.
+#[must_use]
+pub fn class_own_params(
+    analysis: &Analysis,
+    current: &Path,
+    class: &str,
+    ambient_paths: &HashSet<PathBuf>,
+    sema_cache: &FileSemaCache,
+    search_order_cache: &SearchOrderCache,
+) -> Vec<String> {
+    let order = search_order(analysis, current, class, ambient_paths, search_order_cache);
+    for path in order.iter() {
+        let Some(sema) = cached_file_sema(sema_cache, analysis, path) else {
+            continue;
+        };
+        if let Some(decl) = sema.class_named(class) {
+            return decl.tag.params.clone();
         }
     }
-    for field in &info.fields {
-        if let FieldKey::Name(field_name) = &field.key {
-            out.push((field_name.clone(), (field, name.to_string())));
-        }
+    Vec::new()
+}
+
+/// A cache of built [`FileSema`]s keyed by path, shared across calls at the
+/// same [`Analysis::revision`] (N20, round 4 review R10 half-fixed): the
+/// server owns one (inside [`crate::merged_ambient::MergedAmbient`], which
+/// already has the same per-revision lifetime), so a hover and the
+/// goto-definition right after it — or two hovers between edits — reuse the
+/// same parses of every workspace file [`locate_field`]'s BFS visits, rather
+/// than each call rebuilding its own from scratch. The prior fix made the
+/// cache live *within* one `locate_field` call (so a class appearing twice
+/// in one BFS walk was only built once); this makes it live *across* calls,
+/// which is where the review's measurement showed the cost actually was —
+/// the "miss" path (the class is not in `current`) rebuilds every workspace
+/// file's `FileSema` on every single hover and every single goto-definition,
+/// even when nothing changed between them.
+pub type FileSemaCache = RefCell<HashMap<PathBuf, Rc<FileSema>>>;
+
+/// Look up `path` in `cache`, building and inserting a fresh [`FileSema`] on
+/// a miss. `None` when `analysis` does not know `path` (e.g. it names a file
+/// outside the workspace) — never cached, so a later call with a path that
+/// *does* resolve is not permanently shadowed by an earlier miss.
+fn cached_file_sema(
+    cache: &FileSemaCache,
+    analysis: &Analysis,
+    path: &Path,
+) -> Option<Rc<FileSema>> {
+    if let Some(found) = cache.borrow().get(path) {
+        return Some(Rc::clone(found));
     }
+    let built = Rc::new(FileSema::new(analysis, path)?);
+    cache
+        .borrow_mut()
+        .insert(path.to_path_buf(), Rc::clone(&built));
+    Some(built)
+}
+
+/// [`search_order`]'s cache, keyed by `(current, class name)` — living
+/// alongside [`FileSemaCache`] at the same per-revision lifetime, inside
+/// [`crate::merged_ambient::MergedAmbient`] (M57, round 6 review): before
+/// this, every one of [`locate_field_dfs`]'s steps re-ran `search_order`
+/// from scratch, including its [`may_declare_class`] text scan over every
+/// candidate file, even for a class name the *same* revision had already
+/// computed an order for moments earlier — a sibling field's hover, or the
+/// goto-definition right after it. Measured (17 MB of defs, hover cost
+/// linear in ancestry depth before this fix): 33 / 121 / 292 / 558 ms at
+/// depth 2 / 10 / 30 / 60, with a second/third hover or goto-def at the
+/// same class and revision costing the same as the first — zero reuse.
+pub type SearchOrderCache = RefCell<HashMap<(PathBuf, String), Rc<Vec<PathBuf>>>>;
+
+/// [`locate_field`]'s file visit order for one class name in the parent-chain
+/// walk: `current` first (the common case — the cursor's own file, checked
+/// before anything else is built, R10), then every *genuinely ambient* file
+/// (`ambient_paths`, N18 — a real `[types] defs` entry, the one case
+/// `merge_file_types` itself gives elevated precedence over ordinary load
+/// order) that [`may_declare_class`] says could hold the tag, sorted, then
+/// every other project file that could hold it, sorted — see
+/// [`locate_field`]'s own doc for why this order matches the type merge's
+/// real precedence **for one class name**; it says nothing about the order
+/// *different* class names are visited in relative to each other — that is
+/// [`locate_field_dfs`]'s job, not this function's. A `.d.lua`-suffixed file
+/// that is *not* in `ambient_paths` gets no special tier — the merge has no
+/// notion of that suffix at all — so it is filtered and ordered exactly like
+/// any other project file. Recomputed per class name in the walk
+/// (parent-chain classes can live in different files than the class the
+/// walk started from, so a filter keyed on the *original* class would
+/// wrongly hide a parent's own declaration elsewhere) but memoised in
+/// `cache` across calls at one revision (M57): a repeat visit to the same
+/// `(current, name)` pair reuses the previous order rather than re-scanning
+/// every candidate file's text again.
+///
+/// Cheap on a cache miss regardless: this builds no `FileSema` —
+/// [`Analysis::files`] is a handful of path comparisons, and
+/// [`may_declare_class`] scans text [`Analysis::file_text`] already has
+/// cached, not a fresh parse. The `FileSema`s the returned paths name are
+/// the expensive part, and this function builds none of them. The filter
+/// covers every non-`current` file uniformly (N21: it used to apply only to
+/// `.d.lua`-named files, leaving the — typically much larger — rest of the
+/// project unfiltered, even though the doc's own no-false-negative argument
+/// never depended on the `.d.lua` suffix).
+fn search_order(
+    analysis: &Analysis,
+    current: &Path,
+    name: &str,
+    ambient_paths: &HashSet<PathBuf>,
+    cache: &SearchOrderCache,
+) -> Rc<Vec<PathBuf>> {
+    let key = (current.to_path_buf(), name.to_string());
+    if let Some(found) = cache.borrow().get(&key) {
+        return Rc::clone(found);
+    }
+    let may_declare = |p: &&Path| {
+        analysis
+            .file_text(p)
+            .is_some_and(|text| may_declare_class(&text, name))
+    };
+    let mut ambient: Vec<&Path> = analysis
+        .files()
+        .filter(|p| *p != current && ambient_paths.contains(*p))
+        .filter(may_declare)
+        .collect();
+    ambient.sort_unstable();
+    let mut rest: Vec<&Path> = analysis
+        .files()
+        .filter(|p| *p != current && !ambient_paths.contains(*p))
+        .filter(may_declare)
+        .collect();
+    rest.sort_unstable();
+    // Ambient always wins the real collision, even against `current` itself
+    // (`with_project_types` merges every project file onto an already-seeded
+    // ambient base, so the base's declaration survives regardless of which
+    // file happens to be the cursor's own) — so it is visited ahead of
+    // `current`, unless `current` *is* the ambient file, in which case it is
+    // already in the winning tier and the R10 "check current first" shortcut
+    // still applies.
+    let order: Vec<PathBuf> = if ambient_paths.contains(current) {
+        std::iter::once(current)
+            .chain(ambient)
+            .chain(rest)
+            .map(Path::to_path_buf)
+            .collect()
+    } else {
+        ambient
+            .into_iter()
+            .chain(std::iter::once(current))
+            .chain(rest)
+            .map(Path::to_path_buf)
+            .collect()
+    };
+    let order = Rc::new(order);
+    cache.borrow_mut().insert(key, Rc::clone(&order));
+    order
+}
+
+/// Whether `text` could possibly hold a `---@class [(exact)] name` tag — a
+/// linear byte scan for the word `class`, an optional `(exact)` marker,
+/// whitespace, then the word `name`, with no full parse. A *superset*
+/// filter, not a replacement for the real one: it is allowed false positives
+/// (an unrelated occurrence of the words in sequence costs one wasted
+/// `FileSema` build downstream, same as before this existed) but never a
+/// false negative — the luacats grammar has exactly two ways to spell the
+/// tag (`luacats/mod.rs:106`: `---@class [(exact)] Name[...]`), and both are
+/// checked here (N17: the first version of this function checked only the
+/// bare spelling, silently dropping every `(exact)` declaration from the
+/// defs search order — a regression the doc claimed away rather than the
+/// grammar backing up). Word-bounded on both sides so neither `subclass
+/// Name` nor `class NameExtra` counts as a match for `class Name` (safe in
+/// the false-positive direction only: it can only make this return `true`
+/// more often, never `false` for a genuine tag).
+fn may_declare_class(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // `match_indices` only ever yields byte offsets that fall on a `name`
+    // match's own boundaries, which are themselves always char-boundary
+    // aligned (a match is a valid `&str` slice) — `get` never actually
+    // returns `None` here, but reaching for it over direct indexing keeps
+    // this provably panic-free rather than merely reasoned to be.
+    text.match_indices(name).any(|(idx, _)| {
+        let before_ok = text
+            .get(..idx)
+            .map(|s| s.trim_end_matches(char::is_whitespace))
+            .map(|s| {
+                // The `(exact)` marker sits between `class` and the name
+                // (`---@class (exact) Name` / `---@class(exact) Name`, no
+                // space required either side per `parse_class`'s own
+                // `lstrip`+`strip_prefix("(exact)")`) — trim it away, and
+                // any whitespace it leaves behind, before the `class`
+                // suffix check below, so a genuine `(exact)` tag is not
+                // mistaken for a non-match.
+                s.strip_suffix("(exact)")
+                    .map_or(s, |s| s.trim_end_matches(char::is_whitespace))
+            })
+            .and_then(|s| s.strip_suffix("class"))
+            .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+        let after_ok = text
+            .get(idx + name.len()..)
+            .and_then(|s| s.chars().next())
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        before_ok && after_ok
+    })
 }
 
 /// The `---@see` references of an annotation block, in declaration order
@@ -609,13 +1436,14 @@ pub fn named_of(ty: &TypeExpr) -> Option<String> {
     }
 }
 
-/// Whether an annotated type is a function type.
-#[must_use]
-pub fn is_function_type(ty: &TypeExpr) -> bool {
-    match &ty.kind {
-        TypeExprKind::Fun { .. } => true,
-        TypeExprKind::Optional(inner) | TypeExprKind::Paren(inner) => is_function_type(inner),
-        _ => false,
+/// [`named_of`], keeping the whole `Named` node — arguments included —
+/// rather than extracting just its name (#48). `None` for the same shapes
+/// `named_of` declines.
+fn peel_to_named(ty: TypeExpr) -> Option<TypeExpr> {
+    match ty.kind {
+        TypeExprKind::Named { .. } => Some(ty),
+        TypeExprKind::Optional(inner) | TypeExprKind::Paren(inner) => peel_to_named(*inner),
+        _ => None,
     }
 }
 
@@ -856,7 +1684,6 @@ mod tests {
     use super::*;
 
     use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
-    use luabox_syntax::luacats::Span;
 
     fn analyze(text: &str) -> (Analysis, PathBuf) {
         let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
@@ -964,11 +1791,42 @@ mod tests {
     }
 
     #[test]
-    fn is_function_type_peels_optional_and_parens() {
-        assert!(is_function_type(&parse_ty("fun()")));
-        assert!(is_function_type(&parse_ty("fun()?")));
-        assert!(is_function_type(&parse_ty("(fun())")));
-        assert!(!is_function_type(&parse_ty("string")));
+    fn annotated_type_keeps_the_type_arguments_named_of_drops() {
+        let src = "---@type Box<number>\nlocal b = nil\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let lowered = analysis.lower(&path).expect("lowered");
+        let (_, binding) = lowered
+            .file()
+            .bindings()
+            .find(|(_, b)| b.name == "b")
+            .expect("the binding");
+        let ty = sema.annotated_type(binding).expect("an annotation");
+        assert_eq!(render_type(&ty), "Box<number>");
+    }
+
+    #[test]
+    fn annotated_type_peels_optional_and_declines_a_compound_type() {
+        let src = "---@type Box<number>?\nlocal b = nil\n---@type Box|nil\nlocal c = nil\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let lowered = analysis.lower(&path).expect("lowered");
+        let named = |name: &str| {
+            lowered
+                .file()
+                .bindings()
+                .find(|(_, binding)| binding.name == name)
+                .map(|(_, binding)| binding.clone())
+                .expect("the binding")
+        };
+        // `?` peels through, keeping the arguments.
+        assert_eq!(
+            render_type(&sema.annotated_type(&named("b")).expect("an annotation")),
+            "Box<number>"
+        );
+        // A union is not a `Named` reference even after peeling — declines,
+        // matching `class_members_of`'s own boundary.
+        assert!(sema.annotated_type(&named("c")).is_none());
     }
 
     #[test]
@@ -1074,88 +1932,306 @@ mod tests {
         assert!(id.is_none() || sema.binding_type(id.expect("binding")).is_some());
     }
 
-    // === class_of_binding / class_of_name =================================
+    // === locate_field (#51, #54) ==========================================
+
+    /// A workspace root every multi-file `locate_field` test lives under, so
+    /// cross-file class resolution finds every sibling.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    fn analyze_files(files: &[(&str, &str)]) -> Analysis {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
+        for (rel, text) in files {
+            host.apply_change(Change::SetFileText {
+                path: root().join(rel),
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        host.snapshot()
+    }
+
+    /// The `ambient_paths` every `locate_field` test but the N18 precedence
+    /// ones passes: no file is genuinely `[types] defs`-configured, which is
+    /// the truth for a bare `AnalysisHost` with no manifest wired in at all.
+    fn no_ambient() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
+    /// A fresh, empty [`FileSemaCache`], for the two tests that inspect one
+    /// afterwards; everything else takes [`Caches`]' own.
+    fn no_cache() -> FileSemaCache {
+        FileSemaCache::default()
+    }
+
+    /// A fresh, empty [`SearchOrderCache`] — every `locate_field` test builds
+    /// its own rather than sharing one (M57's cross-call sharing is proven
+    /// separately, in
+    /// `locate_field_reuses_a_shared_search_order_cache_across_separate_calls`).
+    fn no_order_cache() -> SearchOrderCache {
+        SearchOrderCache::default()
+    }
+
+    /// The caches and path set a [`FieldLookup`] borrows, owned somewhere
+    /// that outlives the lookup — every `locate_field` test needs all three
+    /// and almost none of them cares what is in any of them, so they are
+    /// bound once here rather than spelled out per call.
+    ///
+    /// The tests that *do* care — N20's and M57's cross-call cache reuse —
+    /// build their own [`FieldLookup`] around a cache they can inspect
+    /// afterwards, which is the whole point of those two.
+    #[derive(Default)]
+    struct Caches {
+        ambient_paths: HashSet<PathBuf>,
+        sema: FileSemaCache,
+        order: SearchOrderCache,
+    }
+
+    impl Caches {
+        /// A lookup over `analysis` with the cursor in `current`.
+        fn at<'a>(&'a self, analysis: &'a Analysis, current: &'a Path) -> FieldLookup<'a> {
+            FieldLookup {
+                analysis,
+                current,
+                ambient_paths: &self.ambient_paths,
+                sema_cache: &self.sema,
+                search_order_cache: &self.order,
+            }
+        }
+
+        /// [`Self::at`] with a genuinely `[types] defs`-configured path set
+        /// (N18) rather than the empty one.
+        fn with_ambient(ambient_paths: HashSet<PathBuf>) -> Caches {
+            Caches {
+                ambient_paths,
+                ..Caches::default()
+            }
+        }
+    }
 
     #[test]
-    fn class_of_binding_peels_an_optional_annotation() {
-        let src = "---@class Point\n---@field x number\n\n---@type Point?\nlocal p = nil\n";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        assert_eq!(
-            sema.class_of_name("p", offset_of(src, "p = nil", 0) + 5)
-                .as_deref(),
-            Some("Point")
+    fn locate_field_finds_a_field_declared_in_the_same_file() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Point\n---@field x number the x coordinate\n",
+        )]);
+        let current = root().join("main.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Point", "x", None).expect("found");
+        assert_eq!(found.path, root().join("main.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
+    }
+
+    /// N20: a `FileSemaCache` shared across two separate `locate_field`
+    /// calls (the shape a hover followed by a goto-definition at the same
+    /// revision produces, via `MergedAmbient::sema_cache`) reuses the same
+    /// built `FileSema` for a file neither call's own BFS walk visits twice
+    /// — the cross-*call* sharing the per-call-local cache (round 4's R10)
+    /// never gave. `point.lua` is visited by both calls (`current` is
+    /// `main.lua` throughout), so the second call must not rebuild it.
+    #[test]
+    fn locate_field_reuses_a_shared_cache_across_separate_calls() {
+        let analysis = analyze_files(&[
+            ("main.lua", "local p = require(\"point\")\nprint(p.x)\n"),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number the x coordinate\nlocal P = {}\nreturn P\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let cache = no_cache();
+        let order_cache = no_order_cache();
+        locate_field(
+            &FieldLookup {
+                analysis: &analysis,
+                current: &current,
+                ambient_paths: &no_ambient(),
+                sema_cache: &cache,
+                search_order_cache: &order_cache,
+            },
+            "Point",
+            "x",
+            None,
+        )
+        .expect("found");
+        let first_built = Rc::clone(
+            cache
+                .borrow()
+                .get(&root().join("point.lua"))
+                .expect("point.lua cached after the first call"),
+        );
+        locate_field(
+            &FieldLookup {
+                analysis: &analysis,
+                current: &current,
+                ambient_paths: &no_ambient(),
+                sema_cache: &cache,
+                search_order_cache: &order_cache,
+            },
+            "Point",
+            "x",
+            None,
+        )
+        .expect("found");
+        let second_built = Rc::clone(
+            cache
+                .borrow()
+                .get(&root().join("point.lua"))
+                .expect("point.lua still cached after the second call"),
+        );
+        assert!(
+            Rc::ptr_eq(&first_built, &second_built),
+            "expected the second call to reuse the first call's built FileSema, not rebuild it"
         );
     }
 
+    /// [`SearchOrderCache`]'s own cross-call sharing (M57, round 6 review):
+    /// a `search_order` call for the same `(current, name)` pair at the same
+    /// revision must reuse the first call's computed order rather than
+    /// re-scanning every candidate file's text again.
     #[test]
-    fn class_of_binding_declines_a_type_that_is_not_a_declared_class() {
-        let src = "---@type Missing\nlocal p = nil\n";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        assert_eq!(sema.class_of_name("p", src.len()), None);
-        assert_eq!(sema.class_of_name("nothing", src.len()), None);
-    }
-
-    // === class_fields =====================================================
-
-    #[test]
-    fn class_fields_collects_parents_first_and_records_the_declaring_class() {
-        let src = "\
----@class Base
----@field id number
-
----@class Derived: Base
----@field name string
-";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        let fields = sema.class_fields("Derived");
-        let rendered: Vec<(String, String)> = fields
-            .iter()
-            .map(|(f, declaring)| {
-                let FieldKey::Name(name) = &f.key else {
-                    panic!("expected a named field, got {:?}", f.key)
-                };
-                let name = name.clone();
-                (name, declaring.clone())
-            })
-            .collect();
-        assert_eq!(
-            rendered,
-            vec![
-                ("id".to_string(), "Base".to_string()),
-                ("name".to_string(), "Derived".to_string()),
-            ]
+    fn locate_field_reuses_a_shared_search_order_cache_across_separate_calls() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ]);
+        let current = root().join("main.lua");
+        let order_cache = no_order_cache();
+        let first = search_order(&analysis, &current, "Base", &no_ambient(), &order_cache);
+        let second = search_order(&analysis, &current, "Base", &no_ambient(), &order_cache);
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "expected the second call to reuse the first call's computed order"
         );
     }
 
+    /// H4: the test above proves the *whole computed order* is reused on a
+    /// cache hit, but does not by itself isolate that
+    /// [`may_declare_class`]'s text scan specifically is what gets skipped,
+    /// as opposed to some other explanation that happens to produce the same
+    /// `Rc`. Proved directly here: the same cache is asked the same
+    /// `(current, "Base")` key against two *different* `Analysis` snapshots
+    /// — the first where `base.lua` genuinely declares `---@class Base`, the
+    /// second where `base.lua` has been rewritten to declare nothing at all.
+    /// If `may_declare_class` re-ran against the second snapshot's text,
+    /// `base.lua` would fail the filter and be missing from the returned
+    /// order. It must instead still contain `base.lua` — the cached order
+    /// from the first call — which is only possible if the second call's
+    /// `may_declare_class` scan never ran.
     #[test]
-    fn own_field_overrides_an_inherited_one_of_the_same_name() {
-        let src = "\
----@class Base
----@field v number
+    fn search_order_cache_skips_the_may_declare_class_scan_on_a_repeat_call() {
+        let base_declares = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ]);
+        let current = root().join("main.lua");
+        let order_cache = no_order_cache();
+        let first = search_order(
+            &base_declares,
+            &current,
+            "Base",
+            &no_ambient(),
+            &order_cache,
+        );
+        assert!(
+            first.contains(&root().join("base.lua")),
+            "sanity: the first call must find base.lua while it still declares Base: {first:?}"
+        );
 
----@class Derived: Base
----@field v string
-";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        let fields = sema.class_fields("Derived");
-        assert_eq!(fields.len(), 1, "{:?}", fields.len());
-        assert_eq!(fields[0].1, "Derived");
-        assert_eq!(render_type(&fields[0].0.ty), "string");
+        let base_no_longer_declares = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "local B = {}\nreturn B\n"),
+        ]);
+        let second = search_order(
+            &base_no_longer_declares,
+            &current,
+            "Base",
+            &no_ambient(),
+            &order_cache,
+        );
+        assert!(
+            second.contains(&root().join("base.lua")),
+            "expected the cached order (still containing base.lua) — a rescan of \
+             `base_no_longer_declares`'s text would have excluded it: {second:?}"
+        );
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the cache hit must return the exact first-call Rc, not a fresh computation"
+        );
+    }
+
+    /// The shape #51 pins: a class required from another file still carries
+    /// its `---@field` description, because the locator searches every
+    /// project file, not just the receiver's own.
+    #[test]
+    fn locate_field_finds_a_field_declared_in_another_file() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("main.lua", "local p = require(\"point\")\nprint(p.x)\n"),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number the x coordinate\nlocal P = {}\nreturn P\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Point", "x", None).expect("found");
+        assert_eq!(found.path, root().join("point.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
+    }
+
+    /// The shape #46/#54 pin: a field inherited from a parent declared in a
+    /// *different* file than the child — the locator walks the parent chain
+    /// across files, not just within the file it started from.
+    #[test]
+    fn locate_field_walks_a_parent_declared_in_another_file() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ]);
+        let current = root().join("main.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Sub", "id", None).expect("found");
+        assert_eq!(found.path, root().join("base.lua"));
     }
 
     #[test]
-    fn class_fields_of_an_undeclared_class_is_empty() {
-        let (analysis, path) = sema_of("---@class Known\n");
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        assert!(sema.class_fields("NotDeclared").is_empty());
+    fn locate_field_declines_a_field_no_ancestor_declares() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
+        let current = root().join("main.lua");
+        assert!(locate_field(&caches.at(&analysis, &current), "Point", "nope", None,).is_none());
+    }
+
+    #[test]
+    fn locate_field_declines_an_undeclared_class() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
+        let current = root().join("main.lua");
+        assert!(locate_field(&caches.at(&analysis, &current), "Nope", "x", None,).is_none());
+    }
+
+    /// A class assembled purely from carrier-attached methods (no
+    /// `---@field` anywhere in its chain) has nothing for the locator to
+    /// find — an honest gap, not a bug (module docs).
+    #[test]
+    fn locate_field_declines_a_carrier_only_attachment() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Greeter\nlocal G = {}\nfunction G.greet() end\n",
+        )]);
+        let current = root().join("main.lua");
+        assert!(locate_field(&caches.at(&analysis, &current), "Greeter", "greet", None,).is_none());
     }
 
     #[test]
     fn inheritance_cycles_terminate() {
+        let caches = Caches::default();
         let src = "\
 ---@class A: B
 ---@field a number
@@ -1164,23 +2240,914 @@ mod tests {
 ---@field b number
 ";
         let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        // The cycle guard stops the walk; each field appears exactly once.
-        assert_eq!(sema.class_fields("A").len(), 2);
-        assert_eq!(sema.class_fields("B").len(), 2);
+        // The cycle guard stops the walk; each side's own field is still
+        // found, and the mutual reference does not hang the lookup.
+        assert!(locate_field(&caches.at(&analysis, &path), "A", "a", None,).is_some());
+        assert!(locate_field(&caches.at(&analysis, &path), "B", "b", None,).is_some());
+        // The cycle also means each side can see the other's field, exactly
+        // as `env::collect_class`'s own cycle guard resolves it.
+        assert!(locate_field(&caches.at(&analysis, &path), "A", "b", None,).is_some());
     }
 
     #[test]
     fn a_non_named_parent_is_skipped() {
+        let caches = Caches::default();
         let src = "\
 ---@class Odd: { x: number }
 ---@field own string
 ";
         let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        let fields = sema.class_fields("Odd");
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].1, "Odd");
+        // The structural-table parent has no name to walk to; `Odd`'s own
+        // field is still found, and the lookup does not panic on the shape.
+        assert!(locate_field(&caches.at(&analysis, &path), "Odd", "own", None,).is_some());
+    }
+
+    // === collect_class's per-key winner (#70) =============================
+
+    /// The merged layer for a workspace, built exactly as `server.rs` builds
+    /// it — what supplies [`locate_field`]'s `origin`.
+    fn merged_of(analysis: &Analysis) -> crate::merged_ambient::MergedAmbient {
+        let base = luabox_types::stdlib_defs(Dialect::Lua54);
+        crate::merged_ambient::MergedAmbient::build(base, &analysis.project_types(), &[])
+    }
+
+    /// A recorded site naming a file this `Analysis` knows is the answer,
+    /// verbatim: the span and description come straight off the record, no
+    /// class is looked up, and a class nothing in the workspace declares
+    /// still resolves.
+    #[test]
+    fn locate_field_returns_the_recorded_declaration_site_without_walking() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("main.lua", "local x = 1\n"),
+            ("elsewhere.lua", "---@class Real\n---@field f string real\n"),
+        ]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Ghost".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("elsewhere.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Ghost", "f", Some(&origin))
+            .expect("the recorded site is the answer");
+        assert_eq!(found.path, root().join("elsewhere.lua"));
+        // Not `elsewhere.lua`'s real `---@field f` ("real", at its own span):
+        // the record is taken as given, not re-derived from the file.
+        assert_eq!(found.desc.as_deref(), Some("recorded"));
+        assert_eq!((found.span.start, found.span.end), (10, 20));
+    }
+
+    /// …and a recorded site naming a file this `Analysis` does **not** know
+    /// falls through to the owner-rooted walk rather than handing a caller a
+    /// path it cannot open. `FieldDeclSite::file` is a `String` `luabox-db` rendered with
+    /// `to_string_lossy` for diagnostics; a goto-definition target built from
+    /// one has to be checked, not assumed (round 8 clean-code audit, coupling
+    /// finding 1). `Real` declares `f` itself, so the owner's own
+    /// declarations answer here; the test below it takes the same
+    /// unresolvable site to an owner that does not.
+    #[test]
+    fn locate_field_declines_a_recorded_site_in_a_file_the_analysis_does_not_know() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[("main.lua", "---@class Real\n---@field f string own\n")]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Real".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("vanished.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Real", "f", Some(&origin))
+            .expect("the walk still answers");
+        assert_eq!(found.path, current, "the walk's answer, not the record's");
+        assert_eq!(found.desc.as_deref(), Some("own"));
+    }
+
+    /// The same unresolvable site against an owner that declares nothing of
+    /// its own: the fallback carries on into the owner's parents, so a member
+    /// only an ancestor documents still has a description and a jump target.
+    ///
+    /// Round 9 review, thread on `sema.rs:922` — the fallback the comment
+    /// claimed and the fallback the code took had diverged, and no test could
+    /// see it because the case above gives both the same answer.
+    #[test]
+    fn locate_field_walks_the_owners_parents_when_a_recorded_site_does_not_resolve() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field f string the b\n\n---@class Sub : Base\n",
+        )]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Sub".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("vanished.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin))
+            .expect("`Base`'s declaration answers once the site is declined");
+        assert_eq!(found.path, current, "the walk's answer, not the record's");
+        assert_eq!(found.desc.as_deref(), Some("the b"));
+    }
+
+    /// The diamond half of #70 at the editor surface: two generic ancestors,
+    /// each reached through both parents on a different binding. The merge
+    /// keeps the last-visited edge — `R`'s `Q<string>` — so hover's
+    /// description and goto-definition's target must name `Q`'s `---@field`,
+    /// not `Slot`'s, which is what the unaided preorder walk reaches first.
+    ///
+    /// Round 9 review, thread on `env.rs:3104`: the issue's headline
+    /// three-declaration fixture answers the same on `develop` as it does
+    /// here, so it evidences nothing. This one does not — the `origin`-fed
+    /// call and the unaided walk disagree, and the unaided walk is `develop`.
+    #[test]
+    fn locate_field_names_the_diamonds_last_visited_edge_not_the_walks_first() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Slot<T>\n---@field f T the f from Slot\n\n\
+             ---@class Q<U>\n---@field f U the f from Q\n\n\
+             ---@class L : Slot<number>, Q<number>\n\n\
+             ---@class R : Slot<string>, Q<string>\n\n\
+             ---@class Both : L, R\n",
+        )]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Both", "f")
+            .expect("`Both.f` resolves");
+        assert_eq!(origin.owner, "Q", "the last-visited edge is `R`'s `Q`");
+
+        let found = locate_field(&caches.at(&analysis, &current), "Both", "f", Some(&origin))
+            .expect("`Q`'s `---@field`");
+        assert_eq!(found.desc.as_deref(), Some("the f from Q"));
+
+        let walked = locate_field(&caches.at(&analysis, &current), "Both", "f", None)
+            .expect("the unaided walk answers too");
+        assert_eq!(
+            walked.desc.as_deref(),
+            Some("the f from Slot"),
+            "preorder reaches `L`'s `Slot` first — the answer `develop` gave, \
+             quoting a class the merge did not take the type from"
+        );
+    }
+
+    /// The merge's answer roots the walk, and rooting it at the *queried*
+    /// class instead is what that buys: `Leaf : Mid, Other` with `Mid`
+    /// attaching `f` as a carrier and `Other` declaring `---@field f string`.
+    /// `member_wins`' first-listed rule gives `Mid` the key, so the type the
+    /// editor renders is the carrier's `fun()` — and a walk from `Leaf`
+    /// exhausts `Mid`'s branch, reaches `Other` and quotes `the f from
+    /// Other`, a description for a declaration the checker ruled out.
+    ///
+    /// Rooted at the owner there is nothing to quote, which is the honest
+    /// answer: no `---@field` anywhere declares the member the merge took.
+    #[test]
+    fn locate_field_roots_the_walk_at_the_owner_not_the_queried_class() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "mid.lua",
+                "---@class Mid\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+            ),
+            (
+                "other.lua",
+                "---@class Other\n---@field f string the f from Other\n",
+            ),
+            ("main.lua", "---@class Leaf : Mid, Other\n"),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Leaf", "f")
+            .expect("`Leaf.f` resolves");
+        assert_eq!(origin.owner, "Mid", "first-listed parent wins the key");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        assert!(
+            locate_field(&caches.at(&analysis, &current), "Leaf", "f", Some(&origin)).is_none(),
+            "`Mid` declares `f` with no `---@field`, and its branch ends there"
+        );
+        // Rooted at `Leaf` — what ignoring the merge's owner would do — the
+        // walk falls out of `Mid`'s branch into `Other`'s and quotes a
+        // declaration resolved from neither the type nor the owner.
+        let from_leaf = locate_field(&caches.at(&analysis, &current), "Leaf", "f", None)
+            .expect("the unaided walk reaches `Other`");
+        assert_eq!(from_leaf.desc.as_deref(), Some("the f from Other"));
+    }
+
+    /// The other side of the line the previous test draws, one edge apart:
+    /// the same three classes, the same `owner: Mid`/`site: None`/`fun()`
+    /// resolution, with `Other` reached through `Mid`'s own `: Other` rather
+    /// than as `Leaf`'s second parent. On the owner's own ancestry it is
+    /// **kept** — deliberately, and despite declaring `string` under a
+    /// `fun()` type. See [`locate_field`]'s doc for why.
+    #[test]
+    fn locate_field_keeps_a_ruled_out_declaration_on_the_owners_own_ancestry() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "mid.lua",
+                "---@class Mid : Other\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+            ),
+            (
+                "other.lua",
+                "---@class Other\n---@field f string the f from Other\n",
+            ),
+            ("main.lua", "---@class Leaf : Mid\n"),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Leaf", "f")
+            .expect("`Leaf.f` resolves");
+        assert_eq!(origin.owner, "Mid", "the carrier owns the key either way");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        let found = locate_field(&caches.at(&analysis, &current), "Leaf", "f", Some(&origin))
+            .expect("the owner's own ancestry is walked, not filtered");
+        assert_eq!(found.path, root().join("other.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the f from Other"));
+    }
+
+    /// One class, its `---@field`s split across two files, and the cursor
+    /// sitting in the file that did **not** win the merge. `search_order`
+    /// hoists `current` ahead of every other ordinary project file (the R10
+    /// shortcut), so the unaided walk answers with the cursor's own file
+    /// while `merge_file_types` took the field from the other one — the
+    /// second of the two shapes #70 exists to close, and the one no
+    /// traversal-order fix inside this module can reach.
+    #[test]
+    fn locate_field_takes_the_merges_own_file_over_its_current_first_order() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("a.lua", "---@class Split\n---@field f string from a\n"),
+            (
+                "main.lua",
+                "---@class Split\n---@field f number from main\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let walked = locate_field(&caches.at(&analysis, &current), "Split", "f", None)
+            .expect("the walk finds something");
+        assert_eq!(
+            walked.path, current,
+            "the unaided walk answers with the cursor's own file"
+        );
+
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Split", "f")
+            .expect("the merged layer resolves `Split.f`");
+        let found = locate_field(&caches.at(&analysis, &current), "Split", "f", Some(&origin))
+            .expect("the recorded site");
+        assert_eq!(
+            found.path,
+            root().join("a.lua"),
+            "the merge took `f` from a.lua, so that is where it is declared"
+        );
+        assert_eq!(found.desc.as_deref(), Some("from a"));
+    }
+
+    /// An owner the merge names but has no recorded site for is asked for
+    /// its **own** declarations first: an ancestor declaring the same name is
+    /// a declaration the checker demonstrably did not use, and surfacing it
+    /// over the owner's would show a description and a jump target for a type
+    /// the editor is not rendering — the class of disagreement #70 closes.
+    #[test]
+    fn locate_field_prefers_a_named_owners_own_declaration_over_an_ancestors() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field f string the base f\n\n---@class Sub : Base\n---@field f string the sub f\n",
+        )]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Sub".to_string(),
+            site: None,
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin))
+            .expect("`Sub` declares its own `f`");
+        assert_eq!(found.desc.as_deref(), Some("the sub f"));
+    }
+
+    /// …and when the named owner declares the member with **no** `---@field`
+    /// at all — a carrier attachment, `function S.greet()` against a parent
+    /// that documented `greet` — the walk continues into its parents rather
+    /// than answering nothing.
+    ///
+    /// This is the shape the narrowing above regressed (round 9 review,
+    /// thread on `sema.rs:952`): the type rendered comes from the carrier
+    /// either way, so withholding the ancestor costs the user the only
+    /// description and the only goto-definition target that exist and buys
+    /// no agreement in return. Reached end-to-end through the merged layer
+    /// the server actually builds, which is what produces `site: None` here.
+    #[test]
+    fn locate_field_walks_a_carrier_owners_parents_for_the_field_it_never_declared() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "base.lua",
+                "---@class Base\n---@field greet fun() the greeting from Base\n",
+            ),
+            (
+                "main.lua",
+                "---@class Sub : Base\nlocal S = {}\nfunction S.greet() end\nreturn S\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Sub", "greet")
+            .expect("`Sub.greet` resolves");
+        assert_eq!(origin.owner, "Sub", "the carrier is the owner");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        let found = locate_field(
+            &caches.at(&analysis, &current),
+            "Sub",
+            "greet",
+            Some(&origin),
+        )
+        .expect("`Base`'s `---@field` is the only declaration there is");
+        assert_eq!(found.path, root().join("base.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the greeting from Base"));
+        // Identical to the unaided walk: `Base` is on the owner's own
+        // ancestry, so the sibling filter never considers it.
+        let walked = locate_field(&caches.at(&analysis, &current), "Sub", "greet", None)
+            .expect("the unaided walk finds it too");
+        assert_eq!(walked.path, found.path);
+        assert_eq!(walked.desc, found.desc);
+    }
+
+    /// An inherited field's recorded site names the **ancestor's** file, not
+    /// the queried class's — the cross-file half of the same fix, reached
+    /// end-to-end through the merged layer the server actually builds.
+    #[test]
+    fn locate_field_follows_the_merge_to_an_ancestors_own_file() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("base.lua", "---@class Base\n---@field b string the b\n"),
+            ("main.lua", "---@class Sub : Base\n"),
+        ]);
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Sub", "b")
+            .expect("`Sub.b` resolves");
+        assert_eq!(origin.owner, "Base");
+        let found = locate_field(
+            &caches.at(&analysis, &root().join("main.lua")),
+            "Sub",
+            "b",
+            Some(&origin),
+        )
+        .expect("the recorded site");
+        assert_eq!(found.path, root().join("base.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the b"));
+    }
+
+    // === defs-vs-project authority (round 4 review R11, round 5 review N18) =
+
+    /// A class declared in a genuinely `[types] defs`-configured file
+    /// collides with the same class declared again in an ordinary project
+    /// file: the search order must put the ambient file first, matching the
+    /// type merge's own "ambient wins a same-name collision" rule — not
+    /// whichever file happens to sort first alphabetically among ordinary
+    /// project files (`a_widget.lua` before `defs/widget.d.lua`). Ambient-ness
+    /// is carried by `ambient_paths` (N18), not by the `.d.lua` suffix alone —
+    /// see `locate_field_visits_an_unconfigured_def_named_file_no_differently_than_any_other_project_file`
+    /// for the one-variable control proving the suffix alone earns nothing.
+    /// The end-to-end proof that this is also what the *type* resolves to —
+    /// not just which file `locate_field` names — is `server.rs`'s
+    /// `a_defs_declaration_wins_a_same_name_collision_over_a_project_files_own`,
+    /// which goes through the real `[types] defs` manifest wiring this unit
+    /// test approximates with an explicit `ambient_paths` set instead.
+    #[test]
+    fn locate_field_visits_a_genuinely_ambient_defs_file_before_a_colliding_project_file() {
+        let analysis = analyze_files(&[
+            (
+                "a_widget.lua",
+                "---@class Widget\n---@field id number the id from a_widget\n",
+            ),
+            (
+                "defs/widget.d.lua",
+                "---@meta\n---@class Widget\n---@field id string the id from defs\n",
+            ),
+        ]);
+        let current = root().join("a_widget.lua");
+        let caches = Caches::with_ambient(HashSet::from([root().join("defs/widget.d.lua")]));
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
+        assert_eq!(found.path, root().join("defs/widget.d.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the id from defs"));
+    }
+
+    /// N18's one-variable control on the test above: same two colliding
+    /// files, `ambient_paths` empty instead of naming `defs/widget.d.lua` —
+    /// the `.d.lua` suffix alone earns no precedence, so the winner reverts
+    /// to ordinary first-loaded-wins (`a_widget.lua` sorts first). This is
+    /// exactly what an unconfigured `[types] defs]` project looks like from
+    /// `locate_field`'s side; `server.rs`'s
+    /// `a_def_named_file_with_no_types_defs_config_is_an_ordinary_project_file_for_collisions`
+    /// is the end-to-end version, through the real manifest wiring.
+    #[test]
+    fn locate_field_visits_an_unconfigured_def_named_file_no_differently_than_any_other_project_file()
+     {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "a_widget.lua",
+                "---@class Widget\n---@field id number the id from a_widget\n",
+            ),
+            (
+                "defs/widget.d.lua",
+                "---@meta\n---@class Widget\n---@field id string the id from defs\n",
+            ),
+        ]);
+        let current = root().join("a_widget.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
+        assert_eq!(found.path, root().join("a_widget.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the id from a_widget"));
+    }
+
+    /// The one-variable control: with no colliding declaration, a `.d.lua`
+    /// file elsewhere in the workspace does not change which file a single,
+    /// unambiguous declaration resolves to.
+    #[test]
+    fn locate_field_still_finds_a_single_declaration_with_a_defs_file_present() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("a_widget.lua", "---@class Widget\n---@field id number\n"),
+            (
+                "defs/other.d.lua",
+                "---@meta\n---@class Other\n---@field y number\n",
+            ),
+        ]);
+        let current = root().join("a_widget.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
+        assert_eq!(found.path, root().join("a_widget.lua"));
+    }
+
+    // === defs-tier pre-filter (finding 2) ===================================
+
+    /// [`may_declare_class`]'s own unit coverage: word-bounded so neither a
+    /// prefix nor a suffix collision counts, but never a false negative for
+    /// the actual tag shape.
+    #[test]
+    fn may_declare_class_matches_the_real_tag_shape() {
+        assert!(may_declare_class("---@class Widget\n", "Widget"));
+        assert!(may_declare_class("---@class Widget: Base\n", "Widget"));
+        // Multiple spaces/tabs between `class` and the name are still a match
+        // (the luacats grammar tolerates them; a false negative here would
+        // silently drop a genuine defs declaration from the search order).
+        assert!(may_declare_class("---@class   Widget\n", "Widget"));
+    }
+
+    /// N17: the grammar has a second way to spell the tag —
+    /// `---@class [(exact)] Name` (`luacats/mod.rs:106`, parsed at `:594`,
+    /// pinned by `luacats/tests.rs:84`) — contradicting this function's own
+    /// doc claim that it does not. A false negative here silently drops a
+    /// genuine `(exact)` defs declaration from the search order (hover loses
+    /// the `---@field` description, goto-definition returns `None`).
+    #[test]
+    fn may_declare_class_matches_the_exact_spelling() {
+        assert!(may_declare_class("---@class (exact) Widget\n", "Widget"));
+        assert!(may_declare_class("---@class(exact) Widget\n", "Widget"));
+        assert!(may_declare_class("---@class (exact)   Widget\n", "Widget"));
+        assert!(may_declare_class(
+            "---@class (exact) Widget: Base\n",
+            "Widget"
+        ));
+    }
+
+    #[test]
+    fn may_declare_class_declines_a_prefix_or_suffix_collision() {
+        // `subclass Widget` — `class` is a suffix of `subclass`, not the
+        // whole preceding word.
+        assert!(!may_declare_class(
+            "-- subclass Widget lives here\n",
+            "Widget"
+        ));
+        // `class WidgetExtra` — `Widget` is a prefix of the actual name.
+        assert!(!may_declare_class("---@class WidgetExtra\n", "Widget"));
+        assert!(!may_declare_class("---@class Other\n", "Widget"));
+    }
+
+    /// The defs-tier filter this backs: a `.d.lua` file whose text cannot
+    /// possibly hold a `---@class Widget` tag is excluded from
+    /// `locate_field`'s visit order entirely, so no `FileSema` is ever built
+    /// for it — the fix finding 2 asks for. Asserted on `search_order`
+    /// directly (white-box) because the *absence* of a wasted `FileSema`
+    /// build has no other externally observable signal — `locate_field`'s
+    /// answer is identical either way, by construction, since the excluded
+    /// file never contains the class.
+    #[test]
+    fn search_order_excludes_a_defs_file_that_cannot_declare_the_class() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Widget\n---@field id number\n"),
+            (
+                "defs/unrelated.d.lua",
+                "---@meta\n---@class Other\n---@field y number\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let order = search_order(
+            &analysis,
+            &current,
+            "Widget",
+            &no_ambient(),
+            &no_order_cache(),
+        );
+        assert!(
+            !order.contains(&root().join("defs/unrelated.d.lua")),
+            "{order:?}"
+        );
+        // `current` is still visited (first, since the defs tier is empty
+        // after filtering) — this is not just "returns nothing".
+        assert!(order.contains(&current), "{order:?}");
+    }
+
+    /// N21: the cheap [`may_declare_class`] pre-filter used to apply only to
+    /// the `.d.lua`-named tier, leaving the — typically much larger —
+    /// ordinary-project tier fully unfiltered, even though the doc's own
+    /// no-false-negative argument never depended on the `.d.lua` suffix. An
+    /// ordinary `.lua` file that cannot possibly declare the class must be
+    /// excluded from the order too, the same as a `.d.lua` one.
+    #[test]
+    fn search_order_excludes_an_ordinary_project_file_that_cannot_declare_the_class() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Widget\n---@field id number\n"),
+            ("unrelated.lua", "---@class Other\n---@field y number\n"),
+        ]);
+        let current = root().join("main.lua");
+        let order = search_order(
+            &analysis,
+            &current,
+            "Widget",
+            &no_ambient(),
+            &no_order_cache(),
+        );
+        assert!(!order.contains(&root().join("unrelated.lua")), "{order:?}");
+        assert!(order.contains(&current), "{order:?}");
+    }
+
+    /// The regression finding 2 explicitly warns against: filtering the defs
+    /// tier by the *original* queried class name would hide a parent class
+    /// that lives only in a defs file whose text never mentions the child's
+    /// name. `search_order` is recomputed per BFS name (`locate_field`'s own
+    /// loop), so the parent's own name is what gets checked against the defs
+    /// tier once the walk reaches it.
+    #[test]
+    fn locate_field_finds_a_parent_field_in_a_defs_file_that_never_mentions_the_child() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            (
+                "defs/base.d.lua",
+                "---@meta\n---@class Base\n---@field id number the id from base\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Sub", "id", None).expect("found");
+        assert_eq!(found.path, root().join("defs/base.d.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the id from base"));
+    }
+
+    /// N17 end to end: an `---@class (exact) Widget` defs declaration must
+    /// still be found by `locate_field` — before the fix, `may_declare_class`
+    /// false-negatived on the `(exact)` spelling, `search_order` filtered the
+    /// defs file out of the tier, and it never appeared in `rest` either
+    /// (`is_def_file` is true for it), so the field vanished from both.
+    #[test]
+    fn locate_field_finds_a_field_in_an_exact_class_defs_file() {
+        let caches = Caches::default();
+        // No collision on purpose (N18: a `.d.lua`-named file has no
+        // elevated precedence over an ordinary project file any more) — this
+        // test is about `(exact)` scanning, not precedence, so `current`
+        // itself declares nothing and the defs file is the only declarer.
+        let analysis = analyze_files(&[
+            ("main.lua", "local w = nil\nprint(w)\n"),
+            (
+                "defs/widget.d.lua",
+                "---@meta\n---@class (exact) Widget\n---@field id string the id from defs\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
+        assert_eq!(found.path, root().join("defs/widget.d.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the id from defs"));
+    }
+
+    // === ancestry depth bound (M45, round 6 review) =======================
+
+    /// `luabox check` refuses to resolve a class chain past
+    /// `MAX_ANCESTRY_DEPTH` (`env.rs`'s `DiamondGuard`); before this fix
+    /// `locate_field`'s own parent-chain walk had no equivalent bound at
+    /// all, so an LSP field lookup on a pathological (e.g. generated) chain
+    /// kept walking — and kept paying `search_order`'s per-class file scan —
+    /// far past the depth the checker itself already gave up resolving.
+    #[test]
+    fn locate_field_is_bounded_by_the_same_ancestry_depth_limit_the_checker_enforces() {
+        let caches = Caches::default();
+        let n = luabox_types::MAX_ANCESTRY_DEPTH + 5;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let (analysis, path) = sema_of(&src);
+        let leaf = format!("C{n}");
+        assert!(
+            locate_field(&caches.at(&analysis, &path), &leaf, "item", None,).is_none(),
+            "a chain this deep must not resolve past the checker's own \
+             {}-class limit",
+            luabox_types::MAX_ANCESTRY_DEPTH
+        );
+    }
+
+    /// The floor-side control: a chain of exactly `MAX_ANCESTRY_DEPTH`
+    /// classes (well within the cap, matching `env.rs`'s own
+    /// `a_class_chain_at_the_ancestry_limit_resolves_fully_and_correctly`
+    /// fixture) still resolves fully — the bound above must not be
+    /// off-by-one in the refusing direction.
+    #[test]
+    fn locate_field_resolves_fully_at_a_chain_just_inside_the_ancestry_depth_limit() {
+        let caches = Caches::default();
+        let n = luabox_types::MAX_ANCESTRY_DEPTH - 1;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let (analysis, path) = sema_of(&src);
+        let leaf = format!("C{n}");
+        assert!(
+            locate_field(&caches.at(&analysis, &path), &leaf, "item", None,).is_some(),
+            "a chain within the limit must still resolve"
+        );
+    }
+
+    // === ancestry width bound (production readiness review, finding 1) ====
+
+    /// `luabox-types`' own `conflicting_diamond_source` shape, k levels of
+    /// `A{i} : A{i-1}<T>, A{i-1}<number>` — both listed parents naming the
+    /// *same* class, so the ancestry is a lattice of k+1 nodes but 2^k
+    /// distinct root-to-leaf **paths**. The M2 DFS rewrite unwound its
+    /// `on_path` guard on the way out of every frame, so it re-expanded per
+    /// path, not per node; the [`luabox_types::MAX_ANCESTRY_DEPTH`] cap
+    /// above never catches it, because the *depth* here is only k.
+    ///
+    /// A **miss** is what pays that in full — and misses are the routine
+    /// case ([`locate_field_dfs`]'s own doc: a carrier-attached
+    /// `function C:method()` is never in [`FileSema::classes`]'s
+    /// `---@field`-only harvest). Run on a background thread with a bounded
+    /// `recv_timeout`, the same idiom `luabox_types::env`'s
+    /// `a_deep_diamond_resolves_without_exponential_blowup` uses, so an
+    /// exponential regression fails this test instead of hanging the suite.
+    /// k = 25 is ~33M path expansions pre-fix (minutes at best) against 26
+    /// node expansions after it.
+    #[test]
+    fn locate_field_expands_a_wide_diamond_ancestry_once_per_class_not_once_per_path() {
+        use std::fmt::Write as _;
+
+        let k = 25_usize;
+        let mut src = String::from("---@class A0<T>\n---@field item T\n");
+        for i in 1..=k {
+            let _ = writeln!(
+                src,
+                "---@class A{i}<T> : A{prev}<T>, A{prev}<number>",
+                prev = i - 1
+            );
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let caches = Caches::default();
+            let (analysis, path) = sema_of(&src);
+            let found = locate_field(
+                &caches.at(&analysis, &path),
+                &format!("A{k}"),
+                "absent",
+                None,
+            );
+            let _ = tx.send(found.is_some());
+        });
+        let found = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "a k=25 diamond miss must complete in well under 10s once each class \
+             is expanded once; the per-path walk it replaced is O(2^25)",
+        );
+        assert!(
+            !found,
+            "no ancestor declares `absent` — the walk must miss, not merely terminate"
+        );
+    }
+
+    /// The correctness control for the once-ever set: a diamond whose
+    /// *shared* ancestor is the only declarer of the field must still be
+    /// reached through the first parent's subtree, and a class reachable
+    /// through two parents must not lose a field the second parent declares
+    /// when the first branch has already visited (and rejected) a sibling.
+    #[test]
+    fn locate_field_still_finds_a_field_only_a_shared_diamond_ancestor_declares() {
+        let caches = Caches::default();
+        let (analysis, path) = sema_of(
+            "\
+---@class Base
+---@field item number
+
+---@class Left : Base
+---@class Right : Base
+---@class Leaf : Left, Right
+",
+        );
+        let found = locate_field(&caches.at(&analysis, &path), "Leaf", "item", None)
+            .expect("`Base.item` is reachable through either parent");
+        assert_eq!(found.path, path);
+    }
+
+    /// Preorder precedence (M2) survives the once-ever set: for
+    /// `Leaf : Left, Right` with `Left : Deep`, both `Deep` and `Right`
+    /// declaring `item`, `Left`'s *entire* subtree is visited before
+    /// `Right`, so `Deep`'s description wins — the same answer the
+    /// path-scoped guard gave.
+    #[test]
+    fn locate_field_keeps_preorder_precedence_across_a_diamond() {
+        let caches = Caches::default();
+        let (analysis, path) = sema_of(
+            "\
+---@class Deep
+---@field item number from the deep left ancestor
+
+---@class Right
+---@field item number from the right parent
+
+---@class Left : Deep
+---@class Leaf : Left, Right
+",
+        );
+        let found = locate_field(&caches.at(&analysis, &path), "Leaf", "item", None)
+            .expect("both branches declare `item`");
+        assert_eq!(found.desc.as_deref(), Some("from the deep left ancestor"));
+    }
+
+    // === depth-carrying visited set (round 8 review, F2) ==================
+
+    /// A class reachable both **deep** (one link under the cap, so its own
+    /// parents are cut) and **shallow** (where they are not), with the field
+    /// declared above it. F2's shape, mirroring `env.rs`'s F1:
+    ///
+    /// - `Z` declares `item`, `Y : Z`,
+    /// - a `B1 … B198` chain ending `B198 : Y`,
+    /// - `A : B1, Y` — `Y` is at depth 199 through the chain and depth 1
+    ///   direct.
+    ///
+    /// Through the chain, `Y` is expanded at 199 and its parent `Z` lands at
+    /// exactly [`luabox_types::MAX_ANCESTRY_DEPTH`], where the cut drops it:
+    /// `Y`'s subtree is unexplored. A once-ever `visited` set then refuses
+    /// `A`'s *direct* `Y` edge at depth 1, so `Z.item` is never found —
+    /// hover, goto-definition and signature help all answer nothing — and
+    /// swapping `A`'s parents to `Y, B1` finds it. One class graph, two
+    /// answers, decided by the order parents happen to be listed in.
+    fn near_cap_two_reach_source(parents: &str) -> String {
+        use std::fmt::Write as _;
+        // A(0) → B1(1) … B198(198) → Y(199) → Z(200): `Z` is exactly at the
+        // cap through the chain, and at depth 2 through `A : … Y`.
+        let links = luabox_types::MAX_ANCESTRY_DEPTH - 2;
+        let mut src = String::from(
+            "---@class Z\n---@field item number the deep declaration\n\n---@class Y : Z\n",
+        );
+        for i in 1..links {
+            let _ = writeln!(src, "---@class B{i} : B{}", i + 1);
+        }
+        let _ = writeln!(src, "---@class B{links} : Y");
+        let _ = writeln!(src, "---@class A : {parents}");
+        src
+    }
+
+    #[test]
+    fn locate_field_re_expands_a_class_first_reached_too_deep_to_expand_its_parents() {
+        let caches = Caches::default();
+        for parents in ["B1, Y", "Y, B1"] {
+            let (analysis, path) = sema_of(&near_cap_two_reach_source(parents));
+            let found = locate_field(&caches.at(&analysis, &path), "A", "item", None)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`Z.item` is two links from `A` through the direct `Y` edge; \
+                     the near-cap reach through the chain must not poison it \
+                     (parents: `{parents}`)"
+                    )
+                });
+            assert_eq!(
+                found.desc.as_deref(),
+                Some("the deep declaration"),
+                "and the winner must be the same one in either parent order"
+            );
+        }
+    }
+
+    // === class-map memo (round 8 review, F23) =============================
+
+    /// The DFS hot path used to rebuild a candidate file's *whole* class map
+    /// — [`FileSema::classes`] walks every annotation item in the file and
+    /// allocates a fresh [`ClassDecl`] (joined doc lines and `---@see` list
+    /// included) for every class it declares — once per class visited in the
+    /// ancestry walk. `SearchOrderCache` memoises only the cheap
+    /// `may_declare_class` text scan around it, and `FileSemaCache` memoises
+    /// only the parse, so a walk `MAX_ANCESTRY_DEPTH` classes deep over `F`
+    /// candidate files derived `F × 200` class maps on the single-threaded
+    /// server, per request.
+    ///
+    /// Measured directly, because a memo that quietly rebuilds is
+    /// indistinguishable from one that works by any behavioural assertion: a
+    /// 199-class chain in one file, one miss lookup (a miss is the case that
+    /// walks the chain to the end — [`locate_field_dfs`]'s own doc on why
+    /// misses are routine), and the file's class map must be derived
+    /// **once**, not once per class.
+    #[test]
+    fn a_deep_ancestry_walk_derives_each_candidate_files_class_map_once() {
+        use std::fmt::Write as _;
+        let n = luabox_types::MAX_ANCESTRY_DEPTH - 1;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let (analysis, path) = sema_of(&src);
+        let cache = no_cache();
+        let sema = cached_file_sema(&cache, &analysis, &path).expect("the file is known");
+        let before = sema.index_builds.get();
+
+        assert!(
+            locate_field(
+                &FieldLookup {
+                    analysis: &analysis,
+                    current: &path,
+                    ambient_paths: &no_ambient(),
+                    sema_cache: &cache,
+                    search_order_cache: &no_order_cache(),
+                },
+                &format!("C{n}"),
+                "absent",
+                None,
+            )
+            .is_none(),
+            "no class in the chain declares `absent` — the walk must miss"
+        );
+
+        assert_eq!(
+            sema.index_builds.get() - before,
+            1,
+            "a {n}-class walk over one candidate file must derive its class \
+             map once, not once per class"
+        );
+    }
+
+    /// The memo is per [`FileSema`], and `FileSemaCache` gives one `FileSema`
+    /// per path for a revision's lifetime — so the reuse above holds across
+    /// separate `locate_field` calls sharing that cache (a hover and the
+    /// goto-definition right after it), not merely within one walk.
+    #[test]
+    fn a_second_lookup_through_a_shared_sema_cache_reuses_the_class_map() {
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field item number\n\n---@class Leaf : Base\n",
+        )]);
+        let current = root().join("main.lua");
+        let cache = no_cache();
+        let order = no_order_cache();
+        for _ in 0..2 {
+            assert!(
+                locate_field(
+                    &FieldLookup {
+                        analysis: &analysis,
+                        current: &current,
+                        ambient_paths: &no_ambient(),
+                        sema_cache: &cache,
+                        search_order_cache: &order,
+                    },
+                    "Leaf",
+                    "item",
+                    None,
+                )
+                .is_some(),
+                "`Base.item` resolves through `Leaf`"
+            );
+        }
+        let sema = cached_file_sema(&cache, &analysis, &current).expect("the file is known");
+        assert_eq!(
+            sema.index_builds.get(),
+            1,
+            "two walks over one cached `FileSema` must share one class map"
+        );
     }
 
     // === functions() ======================================================

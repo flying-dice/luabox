@@ -1,11 +1,11 @@
 ---
-column: doing
+column: done
 labels: [release, burndown]
 priority: high
 agent: claude
-live: true
-status: All four waves landed on develop; opening develop -> main PR
-updatedAt: 2026-08-01T22:30:00.000Z
+live: false
+status: PR #55 approved and merged (f69eed9); #46 #48-#54 closed with evidence; owner notified on #27
+updatedAt: 2026-08-01T23:05:00.000Z
 ---
 # Burn-down 2: the issues the PR #47 review raised
 
@@ -209,3 +209,5 @@ Owner directive: burn down both what was open AND what the reviews opened. Eight
   **Finding 3 — the doc claim was wrong, and measurement is what showed it.** Probed the LSP directly rather than trusting the prose. For a `---@class Point` **carrier** module (`local P = {}`), the binding hovers `local p: {  }` — a *structural table*, **not** the class name — `p.x` hover is null, completion omits `x`, and `luabox check` is **lenient**: `p.x` crosses as `unknown` and `p.nope` is *accepted*. So the old README claim was wrong twice for that spelling: not the class name, and CI does not "still check" the members. The claim was only ever true of the class **instance** spelling (`---@type Point` on the returned local), where the binding does hover `local p: Point` and CI *does* fully enforce (`p.x` is `number`, `p.nope` is `LB0306`) — that is the genuine editor-narrower-than-CI row. Both rows are now a measured table in `docs/03-reference/02-limitations.md`, `requires.rs`'s doc comment is corrected, and README points at the limitations page. Hover behaviour itself deliberately unchanged. Fixtures pin every row on both sides: **+4** `lsp/hover-require.feature`, **+2** `frontend/require.feature`. These pin measured behaviour rather than driving a fix, so they are green on arrival — stated plainly in `9882372` rather than dressed up as a red-to-green cycle. The remaining findings-2 edges are recorded on the same page, and #49 gains the type-parameter scoping rule.
 
   **Gates on the branch head, exit codes direct (`$?`), all 0:** `cargo fmt --all --check` 0 · `cargo clippy --workspace --all-targets -- -D warnings` 0 · `cargo test --workspace` 0 · release `acceptance` 0 — **910/910** scenarios (4973 steps; baseline 894, +16 new) · release `lsp_acceptance` 0 — **214/214** (1556 steps; baseline 210, +4 new) · `lb0510-matrix.sh` 0 — **119/119** lint AND runtime (Lua 5.4.6) · `control-flow-differential.sh` 0 — **112/112**. No test from waves 14/16/19/21/23/24 was modified. Not verified locally: luals's non-trailing nil-admitting arity behaviour (no `lua-language-server` binary available) — handled conservatively and documented as such. **No PR opened**, per the wave brief.
+
+- **claude** (2026-08-01T23:05:00.000Z): **Done.** Shockwave round 1 on PR #55 (FAIL: 1 introduced bug, 1 issue, 2 doc mismatches) was fixed by wave 25 (`sprint/w25-shockwave-r1`, 10 commits, tests-first): per-declaration generic-class parameter scoping unified positionally at three seams (the sweep found a cross-file variant the review didn't name), string receiver methods resolved through the string library (fixed rather than disclosed), trailing nil-admitting params optional for arity, docs corrected to measurement. All three threads replied with before/after and resolved. Round 2: **APPROVED** at `14749f1` — every fix attacked from the direction it could have broken, nothing found. Merged to main at `f69eed9`. Deliberate closes with evidence: #46 #48 #49 #50 #51 #52 #53 #54. Owner report on #27 quoting the reviewer's release-gate statement. Final numbers on main: acceptance 910/910, lsp_acceptance 214/214, differential 224/224 in CI, lb0510-matrix 119/119. Open items are owner-only: #27 tag, #28 branch protection, #34 marketplace credentials.
