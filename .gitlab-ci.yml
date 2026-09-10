@@ -677,6 +677,30 @@ runner-cache-sweep-selftest:
       scripts/tests/selftest-lib.sh
     - bash scripts/tests/runner-cache-sweep-selftest.sh
 
+# #82: self-test for scripts/tests/unused-crate-deps-guard.sh, same
+# discipline as the pair above — the REAL guard script run against a
+# generated 2-crate fixture (no committed corpus: the fixture is three
+# lines of Rust per crate, built in $(mktemp -d) by the self-test itself),
+# plus a read of THIS file to confirm the `unused-crate-deps` job below
+# still calls it from stage `check` with no escape hatch. Needs cargo (the
+# fixture is real, compiled code, not a stub) but no external crates —
+# seconds, not minutes. Gates `unused-crate-deps` via `needs:`, the same
+# shape `luals-parity` uses against `luals-differential-selftest`
+# (decisions/12 clause 4).
+unused-crate-deps-guard-selftest:
+  extends: [.linux, .rules-ci]
+  stage: selftest
+  timeout: 10m
+  needs: []
+  script:
+    - apt_install python3 shellcheck
+    - >
+      shellcheck -S warning
+      scripts/tests/unused-crate-deps-guard.sh
+      scripts/tests/unused-crate-deps-guard-selftest.sh
+      scripts/tests/selftest-lib.sh
+    - bash scripts/tests/unused-crate-deps-guard-selftest.sh
+
 # ===========================================================================
 # stage: check
 # ===========================================================================
@@ -878,6 +902,28 @@ examples:
     - cargo build --release --bin luabox
     - apt_install unzip lua5.1
     - bash scripts/examples.sh
+
+# #82: a normal [dependencies] entry a crate's lib/bin target never reaches
+# — either it belongs in [dev-dependencies] (4fc7ad3 moved exactly one:
+# luabox-lint's luabox-types, used only by its test fixtures) or nothing
+# reaches it at all. Mechanism (rustc's own `unused_crate_dependencies`
+# lint, denied over `--lib --bins` only), scope and the false-positive
+# classes this workspace does not hit are documented in the guard script;
+# this job is a one-line call into it so the rationale lives in exactly one
+# place. No allowlist: the baseline this job runs against is clean.
+# `needs:` gates it on its own self-test rather than on `check`'s cargo run
+# completing first — the two share nothing but the toolchain, and the
+# selftest is what decision 12 asks to have run before this can be trusted
+# to fail.
+unused-crate-deps:
+  extends: [.rust, .rules-ci]
+  stage: check
+  needs:
+    - unused-crate-deps-guard-selftest
+  timeout: 20m
+  script:
+    - apt_install python3
+    - bash scripts/tests/unused-crate-deps-guard.sh
 
 # ===========================================================================
 # stage: gate — the merge-blocking measurements
