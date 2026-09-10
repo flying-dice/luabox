@@ -30,6 +30,28 @@
 //! look like a slow pass. [`Session::finish`] waits on a channel the server
 //! thread fires as `run` returns, with a bound well under that 30 s, and
 //! fails on the *hang*.
+//!
+//! # `LUABOX_PERF_FACTOR` (#84)
+//!
+//! [`read_timeout`] and [`finish_timeout`] widen with the same
+//! `LUABOX_PERF_FACTOR` multiplier `scripts/perf-gate.sh` reads, so a
+//! shared/loaded machine gets slack an idle one does not need. Unset
+//! defaults to `1.0`. Set-but-invalid — non-numeric, non-finite, zero,
+//! negative, or empty/whitespace-only (a parse failure, not treated as
+//! unset) — panics rather than falling back silently. Test-only:
+//! production's `SHUTDOWN_EXIT_TIMEOUT` (`server.rs`) never reads this
+//! variable. See [`resolve_perf_factor`] and [`scaled_wait`] for the exact
+//! parsing and scaling rules.
+//!
+//! `finish_timeout` additionally never grows past
+//! [`FINISH_TIMEOUT_CEILING`] — see that constant's doc comment, and
+//! `finish_still_rejects_a_timeout_at_the_scaled_bound` below for the proof
+//! that the cap keeps rejecting a failure at the largest bound it allows
+//! (that test proves the cap's own logic, not the full `Session::finish`
+//! wiring to it — see its doc comment). `read_timeout` carries no such cap
+//! and can exceed 30 s at a large enough factor (100 s at
+//! `LUABOX_PERF_FACTOR=10`); see [`read_timeout`]'s doc comment for why
+//! that does not weaken the regression proof.
 
 // test code — panics document assumptions
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -50,14 +72,133 @@ use lsp_types::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-/// How long any single read from the server is allowed to take. Generous
-/// relative to the work involved, and far below the 30 s block that is the
-/// failure being tested for.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Unscaled read budget — see [`read_timeout`].
+const READ_TIMEOUT_BASE: Duration = Duration::from_secs(10);
 
-/// How long `run` gets to return after the `exit` goes out. The bug makes it
-/// take 30 s; a healthy server takes microseconds.
-const FINISH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Unscaled completion budget — see [`finish_timeout`].
+const FINISH_TIMEOUT_BASE: Duration = Duration::from_secs(5);
+
+/// The ceiling `finish_timeout` never scales past, regardless of
+/// `LUABOX_PERF_FACTOR`.
+///
+/// The round-9 regression makes `run` block for the full 30 s of
+/// production's `SHUTDOWN_EXIT_TIMEOUT` (`server.rs`) — a wall-clock
+/// `recv_timeout`, not CPU-bound work a loaded box does more slowly, so it
+/// takes just as long on a slow machine as a fast one. An uncapped
+/// `finish_timeout` could eventually scale past that 30 s, at which point a
+/// timeout here would no longer clearly attribute the failure to the
+/// watchdog rather than to `LUABOX_PERF_FACTOR`'s own slack. 25 s keeps
+/// that attribution unambiguous at any factor this suite runs with.
+const FINISH_TIMEOUT_CEILING: Duration = Duration::from_secs(25);
+
+/// `LUABOX_PERF_FACTOR`'s parsing and validation, taking the same shape
+/// `std::env::var` hands back so the policy is testable without ever setting
+/// or clearing the real variable — mutating it from a test would race every
+/// other test in this binary, which shares the process environment and runs
+/// in parallel by default. See the module doc comment for the policy this
+/// implements.
+///
+/// Leading/trailing ASCII whitespace is trimmed before parsing. An empty or
+/// whitespace-only value trims to `""`, which fails `f64::parse` and panics
+/// as "not a float" — it is a parse error like any other, not a second
+/// spelling of unset; only `VarError::NotPresent` defaults to `1.0`. This is
+/// stricter than shells where `VAR=` sometimes reads as empty/falsy rather
+/// than a type error — deliberately: this parser does not claim that parity.
+fn resolve_perf_factor(var: Result<String, std::env::VarError>) -> f64 {
+    match var {
+        Err(std::env::VarError::NotPresent) => 1.0,
+        Err(err) => panic!("LUABOX_PERF_FACTOR is set but not valid UTF-8: {err}"),
+        Ok(raw) => {
+            let factor: f64 = raw
+                .trim()
+                .parse()
+                .unwrap_or_else(|err| panic!("LUABOX_PERF_FACTOR={raw:?} is not a float: {err}"));
+            assert!(
+                factor.is_finite() && factor > 0.0,
+                "LUABOX_PERF_FACTOR must be a finite, positive number, got {factor} \
+                 (parsed from {raw:?})"
+            );
+            factor
+        }
+    }
+}
+
+/// `LUABOX_PERF_FACTOR` — a positive, finite multiplier widening the
+/// timeouts below for a machine under load (a concurrent `cargo build`,
+/// e.g.).
+fn perf_factor() -> f64 {
+    resolve_perf_factor(std::env::var("LUABOX_PERF_FACTOR"))
+}
+
+/// Scales `base` by `factor`, the one place [`read_timeout`],
+/// [`finish_timeout`], and this module's own tests turn a `LUABOX_PERF_FACTOR`
+/// into an actual wait — so the arithmetic cannot drift between them.
+///
+/// [`resolve_perf_factor`] only checks `factor` is finite and positive; that
+/// does not mean `base * factor` is a representable `Duration`.
+/// `Duration::try_from_secs_f64` catches the far end: a factor large enough
+/// (`1e300`, say) to overflow panics here, by name, before
+/// `finish_timeout`'s `.min(FINISH_TIMEOUT_CEILING)` ever runs — otherwise
+/// that overflow panics inside `Duration::mul_f64` with no mention of
+/// `LUABOX_PERF_FACTOR` at all. It does not catch the near end: a factor
+/// small enough (`1e-300`) that `base * factor` rounds to an exact-zero
+/// `Duration` is still `Ok(0)`, which would silently turn "wait `base`,
+/// scaled" into "wait nothing" — the explicit zero check below is what
+/// rejects that.
+fn scaled_wait(base: Duration, factor: f64, which: &str) -> Duration {
+    let secs = base.as_secs_f64() * factor;
+    let scaled = Duration::try_from_secs_f64(secs).unwrap_or_else(|err| {
+        panic!(
+            "LUABOX_PERF_FACTOR={factor} scales {which}'s {base:?} base to an \
+             unrepresentable duration ({secs} s): {err}"
+        )
+    });
+    assert!(
+        scaled > Duration::ZERO,
+        "LUABOX_PERF_FACTOR={factor} scales {which}'s {base:?} base down to \
+         zero — too small a factor to widen anything with"
+    );
+    scaled
+}
+
+/// How long any single read from the server is allowed to take. Unlike
+/// [`finish_timeout`] this has no ceiling: at `LUABOX_PERF_FACTOR=10` it is
+/// 100 s, past the 30 s production `SHUTDOWN_EXIT_TIMEOUT` (`server.rs`).
+/// That does not turn a genuine production timeout into a passing (merely
+/// slow) read here — `read_timeout` only bounds patience for ordinary
+/// handshake/setup traffic before a `shutdown`/`exit` pair is even sent, and
+/// is not the bound this suite's regression proof relies on; `finish_timeout`
+/// is, and that one stays capped under 30 s regardless of factor.
+fn read_timeout() -> Duration {
+    scaled_wait(READ_TIMEOUT_BASE, perf_factor(), "read_timeout")
+}
+
+/// How long `run` gets to return after the `exit` goes out. Scaled by
+/// `LUABOX_PERF_FACTOR`, capped at [`FINISH_TIMEOUT_CEILING`] so a loaded
+/// box's slack cannot also widen this past 30 s and let the round-9
+/// regression pass as merely slow.
+fn finish_timeout() -> Duration {
+    scaled_wait(FINISH_TIMEOUT_BASE, perf_factor(), "finish_timeout").min(FINISH_TIMEOUT_CEILING)
+}
+
+/// The watchdog check [`Session::finish`] makes on the completion channel:
+/// fail on the hang rather than sitting through it. Factored out to a free
+/// function of the same `Result` `mpsc::Receiver::recv_timeout` hands back so
+/// the failure case — `run` never signals, at any `bound` — is exercisable
+/// deterministically, without a real thread or a real wait. See
+/// `finish_still_rejects_a_timeout_at_the_scaled_bound` below.
+fn assert_run_finished(
+    ended: Result<(), mpsc::RecvTimeoutError>,
+    bound: Duration,
+    seen: &[Message],
+) {
+    assert!(
+        ended.is_ok(),
+        "`run` did not return within {bound:?} of the `exit` — \
+         the shutdown handshake is waiting for a notification the server \
+         is already holding. Seen: {seen:?}"
+    );
+}
 
 /// A server running `luabox_lsp::run` on a worker thread, past the initialize
 /// handshake, with the client end here.
@@ -166,7 +307,7 @@ impl Session {
         let message = self
             .client
             .receiver
-            .recv_timeout(READ_TIMEOUT)
+            .recv_timeout(read_timeout())
             .expect("the server answers within the read bound");
         self.seen.push(message.clone());
         message
@@ -266,15 +407,10 @@ impl Session {
     /// [`Self::seen`] afterwards — what the client observed is half of what
     /// these tests are about, and that the thread ended is the other half.
     fn finish(&mut self) -> anyhow::Result<()> {
-        let ended = self.finished.recv_timeout(FINISH_TIMEOUT);
+        let bound = finish_timeout();
+        let ended = self.finished.recv_timeout(bound);
         self.drain();
-        assert!(
-            ended.is_ok(),
-            "`run` did not return within {FINISH_TIMEOUT:?} of the `exit` — \
-             the shutdown handshake is waiting for a notification the server \
-             is already holding. Seen: {:?}",
-            self.seen
-        );
+        assert_run_finished(ended, bound, &self.seen);
         self.thread
             .take()
             .expect("finish is called once")
@@ -496,4 +632,119 @@ fn a_create_after_an_unanswered_one_never_carries_progress_the_client_refused() 
         "only the timed-out token may be reported under: {:?}",
         session.progress_tokens()
     );
+}
+
+/// Check the configured watchdog stays below the production timeout and
+/// that its assertion rejects a timeout result (#84). Injecting the result
+/// avoids a scheduler-dependent sleep. This unit test covers the assertion,
+/// not the full `Session::finish` timeout path; the six protocol tests above
+/// exercise successful shutdown through the real session.
+#[test]
+fn finish_still_rejects_a_timeout_at_the_scaled_bound() {
+    let bound = finish_timeout();
+    assert!(
+        bound < Duration::from_secs(30),
+        "finish_timeout() must stay under production's 30 s \
+         SHUTDOWN_EXIT_TIMEOUT for this proof to mean anything, got {bound:?}"
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_run_finished(Err(mpsc::RecvTimeoutError::Timeout), bound, &[]);
+    }));
+    assert!(
+        outcome.is_err(),
+        "assert_run_finished must panic on a timeout at finish_timeout() \
+         ({bound:?}), even at the largest LUABOX_PERF_FACTOR this cap allows — \
+         a quiet return here means the hang detector stopped detecting hangs"
+    );
+}
+
+/// `resolve_perf_factor`'s parsing policy — every case runs against the
+/// `Result` shape directly, never `std::env::set_var`/`remove_var`: this
+/// binary runs its `#[test]` functions in parallel by default, and the real
+/// process environment is shared across all of them.
+// Every case parses a literal straight from a `&str` and compares it to the
+// same literal typed as `f64` — an exact round trip with no arithmetic in
+// between, so there is no accumulated float error for `float_cmp` to be
+// warning about.
+#[allow(clippy::float_cmp)]
+mod perf_factor_parsing {
+    use super::resolve_perf_factor;
+    use std::env::VarError;
+
+    #[test]
+    fn unset_defaults_to_one() {
+        assert_eq!(resolve_perf_factor(Err(VarError::NotPresent)), 1.0);
+    }
+
+    #[test]
+    fn a_plain_integer_is_honoured() {
+        assert_eq!(resolve_perf_factor(Ok("4".to_string())), 4.0);
+    }
+
+    #[test]
+    fn a_fractional_value_is_honoured() {
+        assert_eq!(resolve_perf_factor(Ok("2.5".to_string())), 2.5);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(resolve_perf_factor(Ok("  3  ".to_string())), 3.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a float")]
+    fn non_numeric_panics() {
+        resolve_perf_factor(Ok("fast".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "finite, positive number")]
+    fn zero_panics() {
+        resolve_perf_factor(Ok("0".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "finite, positive number")]
+    fn negative_panics() {
+        resolve_perf_factor(Ok("-2".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "finite, positive number")]
+    fn nan_panics() {
+        resolve_perf_factor(Ok("NaN".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "finite, positive number")]
+    fn infinite_panics() {
+        resolve_perf_factor(Ok("inf".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "not valid UTF-8")]
+    fn non_unicode_panics() {
+        resolve_perf_factor(Err(VarError::NotUnicode("\u{FFFD}".into())));
+    }
+}
+
+/// **Red-first (#84, B1).** `resolve_perf_factor` alone does not bound
+/// `factor` to what `base * factor` can represent as a `Duration` — these
+/// drive [`scaled_wait`] directly with factors large/small enough to break
+/// that, without ever touching the real `LUABOX_PERF_FACTOR`.
+mod scaled_wait_bounds {
+    use super::{FINISH_TIMEOUT_BASE, READ_TIMEOUT_BASE, scaled_wait};
+
+    #[test]
+    #[should_panic(expected = "unrepresentable duration")]
+    fn a_factor_large_enough_to_overflow_a_duration_panics() {
+        scaled_wait(FINISH_TIMEOUT_BASE, 1e300, "finish_timeout");
+    }
+
+    #[test]
+    #[should_panic(expected = "down to zero")]
+    fn a_factor_small_enough_to_underflow_to_zero_panics() {
+        scaled_wait(READ_TIMEOUT_BASE, 1e-300, "read_timeout");
+    }
 }

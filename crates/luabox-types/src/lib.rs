@@ -254,6 +254,12 @@ impl FileArtifacts {
         requires_of(&self.lowered)
     }
 
+    /// Validate control-flow legality using this file's cached lowering.
+    #[must_use]
+    pub fn control_flow(&self, file: &str, dialect: lua::Dialect) -> Vec<Diagnostic> {
+        luabox_hir::validate::control_flow(file, &self.lowered, dialect)
+    }
+
     /// This file's harvested LuaCATS annotation blocks — [`Self::new`]'s own
     /// `luacats::harvest` call, exposed so a caller that already built
     /// `FileArtifacts` for other reasons (module surface, checking) can
@@ -854,6 +860,36 @@ mod tests {
     use luabox_syntax::lua::{Dialect, parse};
 
     use super::*;
+
+    #[test]
+    fn cached_control_flow_matches_direct_validation() {
+        for source in [
+            "break",
+            "goto missing",
+            "::a:: do ::a:: end",
+            "while true do break end",
+        ] {
+            let parsed = parse(source, Dialect::Lua54);
+            let artifacts = FileArtifacts::new(&parsed);
+            for dialect in [
+                Dialect::Lua51,
+                Dialect::Lua52,
+                Dialect::Lua53,
+                Dialect::Lua54,
+            ] {
+                let expected = luabox_hir::validate::control_flow(
+                    "test.lua",
+                    &luabox_hir::lower(&parsed),
+                    dialect,
+                );
+                assert_eq!(
+                    format!("{:?}", artifacts.control_flow("test.lua", dialect)),
+                    format!("{expected:?}"),
+                    "{source} on {dialect:?}",
+                );
+            }
+        }
+    }
 
     fn ambient_codes(src: &str, defs: &[&str]) -> Vec<String> {
         let ambient = crate::defs::Ambient::build(defs);
