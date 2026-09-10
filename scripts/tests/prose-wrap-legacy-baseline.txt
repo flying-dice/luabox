@@ -1,0 +1,12 @@
+# Pre-rule Markdown with known overlong prose. Each exemption is bound to the
+# complete file: any edit changes its hash and activates the 79-column guard.
+87cfc8ec942029ec528bc555b4de2b5d87888be759c7441ea8538f270fd0b70f  CHANGELOG.md
+bc2023d7a1a4698b05249b928ce987f2d5cc602fef9932a54c510c4a304269ec  docs/01-getting-started/02-development.md
+624c6aff26c5e395b8e89644ec5b9486d1b1a7a6f6f7f43035e427d05782d808  docs/02-guides/01-releasing.md
+3418d8333631a9eccf99a9dabb8e74ae81e136360748b8814500d20e20b9a1e6  docs/02-guides/02-release-confidence.md
+ebb53b1774728635eac62d4f84e05cb389dfb23ce57d99617c66d7ecb79addb9  docs/03-reference/01-spec.md
+3f0594031a9ce3e38ceb10a468e75ee86b52b9d5a7e1bbb9ba4151d6f6307bf4  docs/03-reference/02-limitations.md
+ac9be314997ff46222ac60781e2c2dbba1a7de70181ed4171d11f23e90efab5b  docs/03-reference/03-class-merge-precedence.md
+5341d7bc3bd10b0ed8bbb44f78792520c84936269031498bf2bb91ae25c93531  docs/03-reference/merge-matrix-provenance.md
+098a0943fe4c8505dc7651e7c225150556080d801c1f1b31e68396b87ded880d  docs/04-project/01-backlog.md
+17b578f06a6b6748e5aea3f8d2c955c6cd5d6aec2105dd3edb9a7d30ac23cd3a  docs/bots/ROADMAP.md

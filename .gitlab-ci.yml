@@ -701,6 +701,25 @@ unused-crate-deps-guard-selftest:
       scripts/tests/selftest-lib.sh
     - bash scripts/tests/unused-crate-deps-guard-selftest.sh
 
+# #87: enforce the 79-column prose convention that review previously had to
+# measure by hand. The self-test runs first in the same job and proves the
+# real guard rejects column 80 while preserving code, tables, and URL-only
+# lines. No cargo or Node dependency; this is a seconds-long merge-path gate.
+prose-wrap:
+  extends: [.linux, .rules-ci]
+  stage: selftest
+  timeout: 5m
+  needs: []
+  script:
+    - apt_install shellcheck
+    - >
+      shellcheck -S warning
+      scripts/tests/prose-wrap-guard.sh
+      scripts/tests/prose-wrap-guard-selftest.sh
+      scripts/tests/selftest-lib.sh
+    - bash scripts/tests/prose-wrap-guard-selftest.sh
+    - bash scripts/tests/prose-wrap-guard.sh
+
 # ===========================================================================
 # stage: check
 # ===========================================================================

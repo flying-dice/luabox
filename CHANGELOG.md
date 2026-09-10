@@ -3,8 +3,8 @@
 All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning follows [SemVer](https://semver.org/), with the 0.x caveats
-spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0x).
+Versioning follows [SemVer](https://semver.org/), with the 0.x caveats spelled
+out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0x).
 
 ## [Unreleased]
 
