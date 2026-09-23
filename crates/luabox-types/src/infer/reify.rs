@@ -111,8 +111,15 @@ impl Infer<'_> {
             Some(data) => (data.returns_set, data.returns.clone()),
             None => (false, Vec::new()),
         };
+        // A function reached again through its own returns is described
+        // without them — the returns-unknown signature — the way a shape
+        // cycle cuts off at the catch-all table.
+        let returns_set = returns_set && !self.reify_func_stack.contains(&body);
         let returns = if returns_set {
-            returns.iter().map(|r| self.reify(r)).collect()
+            self.reify_func_stack.push(body);
+            let returns = returns.iter().map(|r| self.reify(r)).collect();
+            self.reify_func_stack.pop();
+            returns
         } else {
             Vec::new()
         };
