@@ -265,7 +265,7 @@ pub(crate) fn run(
         diags: Vec::new(),
         memo: HashMap::new(),
         reify_stack: Vec::new(),
-        reify_func_stack: Vec::new(),
+        reify_func_depth: 0,
         class_ctx: Vec::new(),
     };
     infer.run_pass();
@@ -602,10 +602,9 @@ struct Infer<'a> {
     diags: Vec<Diagnostic>,
     memo: HashMap<usize, Ty>,
     reify_stack: Vec<usize>,
-    /// Inferred functions whose returns are mid-reification: a body that
-    /// returns a dynamic index into its own table (`return S[k]` from
-    /// `S.f`) has itself among its returns, so the walk must bottom out.
-    reify_func_stack: Vec<BodyId>,
+    /// How many inferred functions currently have their returns
+    /// mid-reification; capped by `reify::MAX_NESTED_FUNC_RETURNS`.
+    reify_func_depth: usize,
     /// The stack of enclosing `---@class` method contexts (#115): the class a
     /// carrier method (`function C:m()` / `function C.m()`) is attached to,
     /// pushed while its body is walked. An access `recv.member` is "inside the
@@ -4593,6 +4592,42 @@ local got = S.f
             binding_ty(&out, "got").to_string(),
             "fun(key: unknown): fun(key: unknown)"
         );
+    }
+
+    #[test]
+    fn sibling_functions_returning_dynamic_indexes_reify_in_bounded_time() {
+        // Twelve siblings each returning `S[k]` reach one another in every
+        // order; uncapped, reification walked 12! paths and never finished.
+        let siblings = (1..=12)
+            .map(|i| format!("function S.f{i}(k) return S[k] end"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = outcome(&format!("local S = {{}}\n{siblings}\nlocal got = S.f1\n"));
+        assert_eq!(out.diags, Vec::new());
+        assert!(
+            binding_ty(&out, "got")
+                .to_string()
+                .starts_with("fun(k: unknown): ")
+        );
+    }
+
+    #[test]
+    fn nested_closure_returns_are_spelled_to_the_depth_cap() {
+        // The returned closure's own returns are dropped — the price of
+        // bounding sibling reification (`MAX_NESTED_FUNC_RETURNS`).
+        let src = "\
+local function outer()
+  return function()
+    return function()
+      return 1
+    end
+  end
+end
+local got = outer
+";
+        let out = outcome(src);
+        assert_eq!(out.diags, Vec::new());
+        assert_eq!(binding_ty(&out, "got").to_string(), "fun(): fun()");
     }
 
     #[test]

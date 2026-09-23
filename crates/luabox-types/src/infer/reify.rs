@@ -15,6 +15,14 @@ use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
 
 use super::{ITy, Infer};
 
+/// How many enclosing inferred functions may be mid-reification when a
+/// nested one still gets its returns spelled out; deeper ones reify as the
+/// returns-unknown signature, so a factory shows as `fun(): fun()`. Two would
+/// keep `fun(): fun(): integer`, but `n` sibling functions that each return
+/// `S[k]` then reify to `n^2`-sized types apiece: 1.2 s of `check` at 30
+/// siblings, against 0.13 s at one.
+const MAX_NESTED_FUNC_RETURNS: usize = 1;
+
 impl Infer<'_> {
     /// Snapshot an inference type as a plain structural [`Ty`].
     pub(super) fn reify(&mut self, ity: &ITy) -> Ty {
@@ -111,14 +119,17 @@ impl Infer<'_> {
             Some(data) => (data.returns_set, data.returns.clone()),
             None => (false, Vec::new()),
         };
-        // A function reached again through its own returns is described
-        // without them — the returns-unknown signature — the way a shape
-        // cycle cuts off at the catch-all table.
-        let returns_set = returns_set && !self.reify_func_stack.contains(&body);
-        let returns = if returns_set {
-            self.reify_func_stack.push(body);
+        // Past the depth cap a function is described without its returns —
+        // the returns-unknown signature — the way a shape cycle cuts off at
+        // the catch-all table. That bounds both a function reached again
+        // through its own returns (`function S.f(k) return S[k] end`) and
+        // `n` siblings that each return `S[k]`, which otherwise reach one
+        // another in every order.
+        let spell_returns = returns_set && self.reify_func_depth < MAX_NESTED_FUNC_RETURNS;
+        let returns = if spell_returns {
+            self.reify_func_depth += 1;
             let returns = returns.iter().map(|r| self.reify(r)).collect();
-            self.reify_func_stack.pop();
+            self.reify_func_depth -= 1;
             returns
         } else {
             Vec::new()
@@ -131,7 +142,7 @@ impl Infer<'_> {
             // In display mode the inferred returns are the signature: a
             // dependent file calling this exported function gets them. The
             // checker (seed_params off) keeps the conservative `false`.
-            has_return_annotation: returns_set && self.mode.seeds_params(),
+            has_return_annotation: spell_returns && self.mode.seeds_params(),
             // Explicitly *not* declared: this signature was read off an
             // unannotated body, so its parameters are a description and not a
             // contract. A consumer reaching this function through `require`
