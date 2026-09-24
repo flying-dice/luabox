@@ -2,7 +2,7 @@
 status: Proposed
 date: 2026-09-24
 ---
-# Decision 17 — Typed Lua: C-style typed source that erases to Lua
+# Decision 17 — Typed Lua: typed source with C-style headers that erases to Lua
 
 ## Context
 
@@ -18,9 +18,10 @@ Comment annotations also stay optional and invisible in a way that makes
 Define a small typed dialect of Lua, specified in
 [docs/05-typed-lua/](../docs/05-typed-lua/01-overview.md):
 
-1. `.luac` source files with C-style declarations (`local number x`,
-   `function number f(Point p)`, `typedef`), always strictly checked, compiled
-   by replacing types with spaces so output keeps every line and column.
+1. `.luac` source files with types after names (`local x: number`,
+   `function f(p: Point): number`, `typedef Point = {…}`), always strictly
+   checked, compiled by replacing types with spaces so output keeps every
+   line and column. Every Lua program parses unchanged.
 2. `.luah` headers as the interface of every shared module, including plain
    Lua and native modules, brought in with `#include`; globals declared
    `extern`.
@@ -36,5 +37,4 @@ Define a small typed dialect of Lua, specified in
   header resolution, then LSP. `examples/typed-lua/` holds hand-written
   compiler output that becomes the compiler's golden tests.
 - Existing plain Lua keeps working unchanged: it is used through headers.
-- Some Lua programs parse differently as `.luac` (`local a` then a line
-  starting with a name); porting guidance covers it.
+- `typedef` becomes a reserved word; nothing else in Lua changes meaning.

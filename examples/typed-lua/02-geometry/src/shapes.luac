@@ -1,24 +1,24 @@
 #include <math.luah>
 #include "shapes.luah"
 
-local function number area(Shape s)
+local function area(s: Shape): number
   if s.kind == "circle" then
     return math.pi * s.r ^ 2 -- s is a Circle here
   end
   return s.w * s.h -- and a Rect here
 end
 
-local function number total_area(Shape[] shapes)
-  local number total = 0
+local function total_area(shapes: Shape[]): number
+  local total: number = 0
   for _, s in ipairs(shapes) do
     total = total + area(s)
   end
   return total
 end
 
-local function T? largest<T>(T[] items, number(T item) measure)
-  local T? best = nil
-  local number best_size = -math.huge
+local function largest<T>(items: T[], measure: (item: T) -> number): T?
+  local best: T? = nil
+  local best_size: number = -math.huge
   for _, item in ipairs(items) do
     local size = measure(item)
     if size > best_size then

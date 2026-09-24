@@ -2,10 +2,10 @@
 -- `kind` field tells the shapes apart.
 #include "vec.luah"
 
-typedef { "circle" kind, Vec centre, number r } Circle
-typedef { "rect" kind, Vec origin, number w, number h } Rect
-typedef Circle | Rect Shape
+typedef Circle = { kind: "circle", centre: Vec, r: number }
+typedef Rect = { kind: "rect", origin: Vec, w: number, h: number }
+typedef Shape = Circle | Rect
 
-number area(Shape s)
-number total_area(Shape[] shapes)
-T? largest<T>(T[] items, number(T item) measure)
+area(s: Shape): number
+total_area(shapes: Shape[]): number
+largest<T>(items: T[], measure: (item: T) -> number): T?

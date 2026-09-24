@@ -3,19 +3,20 @@
 Status: **proposed**. This section describes a language that does not have a
 compiler yet. It exists to be reviewed before the work starts.
 
-Typed Lua is Lua with type declarations written the way C writes them. You
-write `.luac` files, the compiler checks them, removes the types, and hands
-you the `.lua` that runs. Nothing is added at runtime.
+Typed Lua is Lua with type declarations. You write `.luac` files, the
+compiler checks them, removes the types, and hands you the `.lua` that runs.
+Nothing is added at runtime. Modules are organised the way C organises
+them: each has a header, and code that uses it includes the header.
 
 ```lua
 #include <string.luah>
 
-local function string greet(string name, integer times)
+local function greet(name: string, times: integer): string
   return string.rep("hello " .. name .. "! ", times)
 end
 
-local string[] names = { "ada", "grace", "linus" }
-for integer i, string name in ipairs(names) do
+local names: string[] = { "ada", "grace", "linus" }
+for i: integer, name: string in ipairs(names) do
   print(i, greet(name, 2))
 end
 ```
@@ -25,12 +26,12 @@ compiles to:
 ```lua
 
 
-local function        greet(       name,         times)
+local function greet(name        , times         )
   return string.rep("hello " .. name .. "! ", times)
 end
 
-local          names = { "ada", "grace", "linus" }
-for         i,        name in ipairs(names) do
+local names           = { "ada", "grace", "linus" }
+for i         , name         in ipairs(names) do
   print(i, greet(name, 2))
 end
 ```
@@ -40,9 +41,10 @@ matches the source. An error at runtime points at the line you wrote.
 
 ## The idea in five rules
 
-1. **Types go before names, as in C.** `local number x`,
-   `local function number area(Rect r)`,
-   `typedef { number x, number y } Point`.
+1. **Types follow names.** `local x: number`,
+   `local function area(r: Rect): number`,
+   `typedef Point = { x: number, y: number }`. Every Lua program still
+   parses exactly as it does in Lua.
 2. **Types are written, not guessed.** A variable's type is what you wrote,
    or what the right-hand side already has — `local n = 1` is an `integer`.
    Nothing is ever worked out from how a value is used later.
@@ -88,11 +90,13 @@ Typed Lua types those and adds nothing that would need runtime support.
 These are the decisions most likely to be argued with. Each trades something
 away on purpose.
 
-- **C syntax means a few Lua programs read differently.** `local a` followed
-  by `b = 1` on the next line reads as `local a b` — a declaration of `b` —
-  so plain Lua relying on the two-statement reading needs a `;`. `typedef`
-  becomes a reserved word. Casts are `<T> x`, not C's `(T) x`, because Lua
-  already reads `(T) {…}` and `(T) "…"` as calls.
+- **Types after names, C for everything else.** `name: Type` puts every
+  type where Lua allows nothing, so a parser never has to guess and plain
+  Lua parses unchanged. It also matches how an editor shows a type it
+  worked out (`local n = 1` displays as `local n: integer = 1`). Headers,
+  `#include`, `extern` and `typedef` follow C. `typedef` becomes a reserved
+  word. Casts are `<T> x`: C's `(T) x` clashes with Lua's `(f) "…"` and
+  `(f) {…}` calls.
 - **Every shared module needs a hand-written header.** That is extra typing
   for internal modules. In return, a module's interface is always one short
   file you can read, and changing an implementation cannot silently change
@@ -103,7 +107,7 @@ away on purpose.
   steers code to the constructor form, which allocates once instead of
   rehashing as fields are added.
 - **No operator overloading.** A vector type with an `__add` metamethod
-  still cannot be added with `+`; you call `Vec.add(a, b)`. Operators mean
+  still cannot be added with `+`; you call `vec.add(a, b)`. Operators mean
   exactly one thing, and nothing about a type depends on metamethods other
   than `__index`.
 - **Narrowing works on locals, not fields.** `if p.label then` does not

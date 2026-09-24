@@ -7,11 +7,11 @@ refer to the [specification](05-specification.md). Snippets leave out the
 
 ## Variables
 
-Write the type before the name, or let the value supply it:
+Write the type after the name, or let the value supply it:
 
 ```lua
-local integer count = 0
-local string name = "ada"
+local count: integer = 0
+local name: string = "ada"
 local ratio = 0.5          -- number, from the literal
 local label = name         -- string, from `name`
 ```
@@ -26,23 +26,25 @@ count = "many"             -- error: `string` is not compatible with `integer`
 ```
 
 A variable declared without a value starts as `nil`, so its type must say
-so: `local string? label`. Leaving out both the type and the value is an
+so: `local label: string?`. Leaving out both the type and the value is an
 error — there is nothing to take a type from.
 
 `integer` is a whole number and fits anywhere a `number` does. `1` is an
 `integer` literal, `1.0` and `1e3` are `number`s.
 
+Attributes go before the type: `local limit <const>: number = 10`.
+
 ## Functions
 
-The return type goes between `function` and the name; each parameter's type
-goes before it:
+Each parameter's type follows it, and the return type follows the
+parameter list:
 
 ```lua
-local function number area(number w, number h)
+local function area(w: number, h: number): number
   return w * h
 end
 
-local function void log(string message)   -- `void` may be left out
+local function log(message: string)      -- returns nothing; `: void` optional
   print("[log] " .. message)
 end
 ```
@@ -50,8 +52,8 @@ end
 **Several results** are written as a list:
 
 ```lua
-local function (number?, string?) parse(string s)
-  local number? n = tonumber(s)
+local function parse(s: string): (number?, string?)
+  local n: number? = tonumber(s)
   if n then return n, nil end
   return nil, "not a number: " .. s
 end
@@ -63,7 +65,7 @@ local value, err = parse("42")   -- number?, string?
 leave trailing ones out:
 
 ```lua
-local function string pad(string s, integer? width)
+local function pad(s: string, width: integer?): string
   return string.rep(" ", (width or 8) - #s) .. s
 end
 
@@ -74,20 +76,25 @@ pad("x", 4)     -- fine
 **Varargs** have a type too; `{ ... }` is then an array of it:
 
 ```lua
-local function number sum(number ...)
-  local number total = 0
+local function sum(...: number): number
+  local total: number = 0
   for _, n in ipairs({ ... }) do total = total + n end
   return total
 end
+```
+
+**Function types** are written `(params) -> result`:
+
+```lua
+local on_done: ((ok: boolean) -> void)? = nil
+typedef Compare<T> = (a: T, b: T) -> boolean
 ```
 
 **Callbacks** passed where a function type is expected take their types from
 it, so they need no declarations:
 
 ```lua
-#include <table.luah>
-
-local string[] names = { "lua", "c" }
+local names: string[] = { "lua", "c" }
 table.sort(names, function(a, b) return a < b end)   -- a, b are string
 ```
 
@@ -95,11 +102,11 @@ table.sort(names, function(a, b) return a < b end)   -- a, b are string
 The arguments decide what the parameters stand for at each call:
 
 ```lua
-local function T? first<T>(T[] items)
+local function first<T>(items: T[]): T?
   return items[1]
 end
 
-local string? s = first({ "a", "b" })   -- T is string
+local s: string? = first({ "a", "b" })   -- T is string
 ```
 
 A function that declares results must return on every path. Ending in
@@ -107,12 +114,12 @@ A function that declares results must return on every path. Ending in
 
 ## Tables
 
-Name a table shape with `typedef`. Records list their fields, type first:
+Name a table shape with `typedef`. Records list their fields:
 
 ```lua
-typedef { string name, number price, string? note } Item
+typedef Item = { name: string, price: number, note: string? }
 
-local Item apple = { name = "apple", price = 0.5 }   -- `note` may be left out
+local apple: Item = { name = "apple", price = 0.5 }   -- `note` may be left out
 ```
 
 A table written where a type is expected is checked against it exactly:
@@ -121,12 +128,12 @@ every required field present, no extra fields, nested tables checked too.
 **Arrays and maps** are written with suffixes:
 
 ```lua
-local string[] names = { "ada", "grace" }           -- array
-local integer[string] ages = { ada = 36 }            -- map: string → integer
-local boolean[string] seen = {}                      -- a set
+local names: string[] = { "ada", "grace" }        -- array
+local ages: integer[string] = { ada = 36 }         -- map: string → integer
+local seen: boolean[string] = {}                   -- a set
 
-names[#names + 1] = "linus"      -- arrays and maps take new entries
-local integer? age = ages["bob"] -- a map lookup may miss, so it is `integer?`
+names[#names + 1] = "linus"        -- arrays and maps take new entries
+local age: integer? = ages["bob"]  -- a map lookup may miss, so it is `integer?`
 ```
 
 **Records do not grow.** A record's fields are fixed when it is built;
@@ -141,7 +148,9 @@ M.version = "1.0"          -- error: `{}` has no field `version`
 return { version = "1.0", area = area }
 ```
 
-Assigning `nil` to a field is allowed only if the field's type admits it.
+Assigning `nil` to a field is allowed only if the field's type admits it. A
+record that also takes arbitrary keys says so with an index part:
+`{ name: string, [string]: any }`.
 
 ## Objects
 
@@ -151,15 +160,15 @@ with its methods, write the methods as local functions, and build the
 metatable in one constructor:
 
 ```lua
-typedef { number x, number y, number(Vec self) len } Vec
+typedef Vec = { x: number, y: number, len: (self: Vec) -> number }
 
-local function number len(Vec self)
+local function len(self: Vec): number
   return math.sqrt(self.x * self.x + self.y * self.y)
 end
 
 local Meta = { __index = { len = len } }
 
-local function Vec new(number x, number y)
+local function new(x: number, y: number): Vec
   return setmetatable({ x = x, y = y }, Meta)
 end
 
@@ -171,19 +180,19 @@ why `{ x = x, y = y }` becomes a `Vec` (§6.7). Operators are not
 overloadable: write `add(a, b)`, not `a + b`, even if the metatable has
 `__add`.
 
-When methods need each other before they are all defined, forward-declare
+When functions need each other before they are all defined, forward-declare
 the one used early (§6.3):
 
 ```lua
-typedef { number x, number y, Vec(Vec self, number k) scale } Vec
+typedef Vec = { x: number, y: number, scale: (self: Vec, k: number) -> Vec }
 
-local Vec(number x, number y) new          -- declared, defined below
+local new: (x: number, y: number) -> Vec     -- declared, defined below
 
-local function Vec scale(Vec self, number k)
+local function scale(self: Vec, k: number): Vec
   return new(self.x * k, self.y * k)
 end
 
-function Vec new(number x, number y)
+function new(x: number, y: number): Vec
   return setmetatable({ x = x, y = y }, { __index = { scale = scale } })
 end
 ```
@@ -195,7 +204,7 @@ of its members, check which one it is; the check narrows the type inside the
 branch (§6.9):
 
 ```lua
-local function string describe(string | number v)
+local function describe(v: string | number): string
   if type(v) == "number" then
     return "number " .. v        -- v is number
   end
@@ -207,7 +216,7 @@ A `nil` check is the most common narrowing, and an early return narrows the
 rest of the function:
 
 ```lua
-local function string upper_name(Item? item)
+local function upper_name(item: Item?): string
   if not item then
     return "(none)"
   end
@@ -219,11 +228,11 @@ end
 narrows to the matching member:
 
 ```lua
-typedef { "circle" kind, number r } Circle
-typedef { "rect" kind, number w, number h } Rect
-typedef Circle | Rect Shape
+typedef Circle = { kind: "circle", r: number }
+typedef Rect = { kind: "rect", w: number, h: number }
+typedef Shape = Circle | Rect
 
-local function number area(Shape s)
+local function area(s: Shape): number
   if s.kind == "circle" then
     return math.pi * s.r ^ 2
   end
@@ -261,7 +270,7 @@ The Lua convention of returning `nil, message` on failure types naturally as
   is an error. Casting from `any` or `unknown` is always allowed.
 
 ```lua
-local config = <{ string host, integer port }> decode(text)   -- decode returns unknown
+local config = <{ host: string, port: integer }> decode(text)  -- decode returns unknown
 ```
 
 ## Porting a Lua file
@@ -272,6 +281,5 @@ local config = <{ string host, integer port }> decode(text)   -- decode returns 
    constructor.
 4. Add `#include` lines for the libraries it uses and the modules it
    requires.
-5. Check for a `local` at the end of a line followed by a line that starts
-   with a name; add `;` if they are meant to be two statements.
+5. Rename anything called `typedef`.
 6. Compile, and fix what it reports.

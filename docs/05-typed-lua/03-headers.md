@@ -11,25 +11,25 @@ and never produce output. Section numbers (§) refer to the
 -- geometry.luah
 #include "vec.luah"                     -- other headers this one needs
 
-typedef { number w, number h } Rect     -- types users of the module need
+typedef Rect = { w: number, h: number } -- types users of the module need
 
-number area(Rect r)                     -- functions the module provides
-Rect unit()
-string version                          -- other fields of the module
+area(r: Rect): number                   -- functions the module provides
+unit(): Rect
+version: string                         -- other fields of the module
 
-extern number SCALE                     -- a global (rare in a module header)
+extern SCALE: number                    -- a global (rare in a module header)
 ```
 
-A function is written as a prototype: return type, name, typed parameters,
-no body. Everything a header declares that is not a `typedef` or `extern` is
-a field of the module's value — `require("geometry").area`, `.unit` and
-`.version` above.
+A function is written as a prototype: name, typed parameters, return type,
+no body. A prototype with no return type returns nothing. Everything a
+header declares that is not a `typedef` or `extern` is a field of the
+module's value — `require("geometry").area`, `.unit` and `.version` above.
 
 A module whose value is not a table says what it is with `return`:
 
 ```lua
 -- inspect.luah
-return string(any value)
+return (value: any) -> string
 ```
 
 ## Headers for your own modules
@@ -65,8 +65,8 @@ The implementation includes its own header to use the types in it:
 -- geometry.luac
 #include "geometry.luah"
 
-local function number area(Rect r) return r.w * r.h end
-local function Rect unit() return { w = 1, h = 1 } end
+local function area(r: Rect): number return r.w * r.h end
+local function unit(): Rect return { w = 1, h = 1 } end
 
 return { area = area, unit = unit, version = "1.0" }
 ```
@@ -82,10 +82,10 @@ describes what it does, and Typed Lua code can use it:
 
 ```lua
 -- csv.luah, next to csv.lua
-typedef string[] Row
+typedef Row = string[]
 
-Row split(string line, string sep)
-Row[] parse(string text)
+split(line: string, sep: string): Row
+parse(text: string): Row[]
 ```
 
 A header for plain Lua is trusted: the compiler can't check `csv.lua`
@@ -101,12 +101,12 @@ header after the module: `require("socket.core")` is declared by
 
 ```lua
 -- headers/socket/core.luah
-typedef {
-  (integer?, string?)(Socket self, string data) send,
-  void(Socket self) close,
-} Socket
+typedef Socket = {
+  send: (self: Socket, data: string) -> (integer?, string?),
+  close: (self: Socket) -> void,
+}
 
-(Socket?, string?) connect(string host, integer port)
+connect(host: string, port: integer): (Socket?, string?)
 ```
 
 A native module's objects are usually userdata with a metatable. Describe
@@ -119,17 +119,17 @@ provides:
 
 ```lua
 -- love.luah
-typedef {
-  void("fill" | "line" mode, number x, number y, number w, number h) rectangle,
-} LoveGraphics
+typedef LoveGraphics = {
+  rectangle: (mode: "fill" | "line", x: number, y: number, w: number, h: number) -> void,
+}
 
-typedef {
-  LoveGraphics graphics,
-  (void(number dt))? update,
-  (void())? draw,
-} Love
+typedef Love = {
+  graphics: LoveGraphics,
+  update: ((dt: number) -> void)?,
+  draw: (() -> void)?,
+}
 
-extern Love love
+extern love: Love
 ```
 
 Reading or writing a global that no included header declares is an error,

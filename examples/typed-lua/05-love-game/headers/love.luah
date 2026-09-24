@@ -2,25 +2,25 @@
 -- as a global, so it is declared `extern`. The callbacks are optional fields
 -- the game fills in; LÖVE calls whichever ones are set.
 
-typedef "fill" | "line" DrawMode
-typedef "left" | "right" | "up" | "down" | "escape" Key
+typedef DrawMode = "fill" | "line"
+typedef Key = "left" | "right" | "up" | "down" | "escape"
 
-typedef {
-  void(DrawMode mode, number x, number y, number w, number h) rectangle,
-  void(string text, number x, number y) print,
-} LoveGraphics
+typedef LoveGraphics = {
+  rectangle: (mode: DrawMode, x: number, y: number, w: number, h: number) -> void,
+  print: (text: string, x: number, y: number) -> void,
+}
 
-typedef { boolean(Key key) isDown } LoveKeyboard
+typedef LoveKeyboard = { isDown: (key: Key) -> boolean }
 
-typedef { void() quit } LoveEvent
+typedef LoveEvent = { quit: () -> void }
 
-typedef {
-  LoveGraphics graphics,
-  LoveKeyboard keyboard,
-  LoveEvent event,
-  (void())? load,
-  (void(number dt))? update,
-  (void())? draw,
-} Love
+typedef Love = {
+  graphics: LoveGraphics,
+  keyboard: LoveKeyboard,
+  event: LoveEvent,
+  load: (() -> void)?,
+  update: ((dt: number) -> void)?,
+  draw: (() -> void)?,
+}
 
-extern Love love
+extern love: Love

@@ -2,13 +2,13 @@
 -- headers/love.luah; assigning its callback fields defines the game.
 #include <love.luah>
 
-typedef { number x, number y, number size, number speed } Player
+typedef Player = { x: number, y: number, size: number, speed: number }
 
-local Player player = { x = 150, y = 110, size = 20, speed = 160 }
+local player: Player = { x = 150, y = 110, size = 20, speed = 160 }
 
 -- The direction each key moves the player in.
-local number[Key] dx = { left = -1, right = 1 }
-local number[Key] dy = { up = -1, down = 1 }
+local dx: number[Key] = { left = -1, right = 1 }
+local dy: number[Key] = { up = -1, down = 1 }
 
 function love.load()
   player.x, player.y = 150, 110

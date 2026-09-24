@@ -4,11 +4,11 @@
 
 
 
-local        player = { x = 150, y = 110, size = 20, speed = 160 }
+local player         = { x = 150, y = 110, size = 20, speed = 160 }
 
 -- The direction each key moves the player in.
-local             dx = { left = -1, right = 1 }
-local             dy = { up = -1, down = 1 }
+local dx              = { left = -1, right = 1 }
+local dy              = { up = -1, down = 1 }
 
 function love.load()
   player.x, player.y = 150, 110

@@ -5,12 +5,12 @@
 -- A connected socket is userdata; the header describes it by the methods its
 -- metatable provides.
 
-typedef {
-  (integer?, string?)(Socket self, string data) send,
-  (string?, string?)(Socket self, string | integer pattern) receive,
-  void(Socket self, number? seconds) settimeout,
-  void(Socket self) close,
-} Socket
+typedef Socket = {
+  send: (self: Socket, data: string) -> (integer?, string?),
+  receive: (self: Socket, pattern: string | integer) -> (string?, string?),
+  settimeout: (self: Socket, seconds: number?) -> void,
+  close: (self: Socket) -> void,
+}
 
-(Socket?, string?) connect(string host, integer port)
-number gettime()
+connect(host: string, port: integer): (Socket?, string?)
+gettime(): number

@@ -3,19 +3,19 @@
 
 local csv = require("csv")
 
-typedef { string name, number price } Item
+typedef Item = { name: string, price: number }
 
-local function Item? to_item(Row row)
-  local number? price = tonumber(row[2])
+local function to_item(row: Row): Item?
+  local price: number? = tonumber(row[2])
   if price == nil then
     return nil
   end
   return { name = row[1], price = price }
 end
 
-local Row[] rows = csv.parse("apple,0.5\npear,0.75\nbad,row\nplum,1.25")
-local number total = 0
-for integer line, Row row in ipairs(rows) do
+local rows: Row[] = csv.parse("apple,0.5\npear,0.75\nbad,row\nplum,1.25")
+local total: number = 0
+for line: integer, row: Row in ipairs(rows) do
   local item = to_item(row)
   if item then
     total = total + item.price

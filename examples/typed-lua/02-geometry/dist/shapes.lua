@@ -1,24 +1,24 @@
 
 
 
-local function        area(      s)
+local function area(s       )
   if s.kind == "circle" then
     return math.pi * s.r ^ 2 -- s is a Circle here
   end
   return s.w * s.h -- and a Rect here
 end
 
-local function        total_area(        shapes)
-  local        total = 0
+local function total_area(shapes         )
+  local total         = 0
   for _, s in ipairs(shapes) do
     total = total + area(s)
   end
   return total
 end
 
-local function    largest   (    items,                measure)
-  local    best = nil
-  local        best_size = -math.huge
+local function largest   (items     , measure                     )
+  local best     = nil
+  local best_size         = -math.huge
   for _, item in ipairs(items) do
     local size = measure(item)
     if size > best_size then
