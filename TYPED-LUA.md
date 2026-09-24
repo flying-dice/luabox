@@ -1,6 +1,6 @@
 # Typed Lua — Language Specification
 
-Draft 3.
+Draft 4.
 
 ## 1. Overview
 
@@ -324,6 +324,8 @@ declared function return — takes its parameter and return types from that
 expected type and need not repeat them.
 
 ```lua
+#include <table.luah>
+
 table.sort(list, function(a, b) return a < b end)   -- a, b from `list`
 ```
 
@@ -334,31 +336,27 @@ Recursion needs no special rule: the signature is declared before the body.
 A table constructor's type is the record (or array, or map) of its entries,
 with literal values widened.
 
-**Open tables.** A table constructor bound to a local is *open* for the
-rest of the block that declares it, until it *escapes* — is returned,
-passed as an argument, assigned to another variable or field, or captured
-by a function that runs before the block ends. While open, assigning a new
-field adds it to the table's type, with the value's (known) type:
+**Tables are fixed at construction.** A table's type is settled by its
+constructor or its declared type, and never grows. Assigning a field the
+type does not have is an error; assigning a field it has must be compatible
+with the field's type. A table is built whole, in one constructor:
 
 ```lua
-local M = {}
-M.version = "1.0"
-function number M.area(number w, number h) return w * h end
-return M       -- escapes here, as { string version, number(number, number) area }
-```
+local function number area(number w, number h) return w * h end
 
-**Sealed tables.** Once a table escapes, or when its type is declared, its
-type is fixed. Assigning a field it does not have is an error; assigning a
-field it has must be compatible with the field's type.
+return { version = "1.0", area = area }
+```
 
 **Checked constructors.** A constructor checked directly against a record
 type — a declared binding, an argument, a returned value — must provide
-every required field and no field the record does not declare.
+every required field and no field the record does not declare. An empty
+constructor is a valid array or map: `local string[] names = {}`.
 
 ### 6.5 Methods and `self`
 
-`function t:m(...)` is `function t.m(self, ...)`. The type of `self` is the
-type of `t`. To give instances a different type from the table that holds
+`function t:m(...)` is `function t.m(self, ...)`, an assignment to the field
+`m`, which `t`'s type must declare (§6.4). The type of `self` is the type of
+`t`. To give instances a different type from the table that holds
 their methods, write the parameter explicitly:
 `function number Point.len(Point self)`.
 
@@ -379,16 +377,17 @@ Point new(number x, number y)
 
 ```lua
 -- point.luac
+#include <math.luah>
 #include "point.luah"
 
-local Proto = {}
-Proto.__index = Proto
-function number Proto.len(Point self)
+local function number len(Point self)
   return math.sqrt(self.x ^ 2 + self.y ^ 2)
 end
 
+local Meta = { __index = { len = len } }
+
 local function Point new(number x, number y)
-  return setmetatable({ x = x, y = y }, Proto)
+  return setmetatable({ x = x, y = y }, Meta)
 end
 
 return { new = new }
@@ -456,9 +455,16 @@ end of the file.
 ### 7.3 Globals
 
 A global is declared with `extern` in a header (§8.5). Reading or assigning
-a global that no included header declares is an error. The standard library
-of the target Lua version is declared by standard headers that every chunk
-includes implicitly.
+a global that no included header declares is an error.
+
+The standard library of the target Lua version comes as standard headers,
+one per library, found in the header directories: `<string.luah>`,
+`<table.luah>`, `<math.luah>`, `<io.luah>`, `<os.luah>`,
+`<coroutine.luah>`, `<utf8.luah>`, `<debug.luah>`. A file uses a library
+only after including its header. The base functions (`print`, `type`,
+`pairs`, `ipairs`, `tostring`, `tonumber`, `error`, `assert`, `pcall`,
+`select`, `setmetatable`, `getmetatable`, `rawget`, `rawset`, `require`,
+and the rest of the target version's base library) need no include.
 
 ## 8. Headers
 
@@ -601,7 +607,7 @@ are:
 | mismatch             | a value not compatible with its target               |
 | arity                | too few or too many arguments                        |
 | missing field        | a checked constructor lacks a required field         |
-| unknown field        | reading, or writing to a sealed table, a field the type lacks |
+| unknown field        | reading or writing a field the type lacks            |
 | undefined operator   | an operator on operands it is not defined for        |
 | unknown type name    | a type that names nothing in scope                   |
 | invalid cast         | a cast between unrelated types                       |
@@ -677,17 +683,3 @@ line of the bundle the source file and line it came from:
 Columns within a mapped line are the source's columns, except where a
 rewrite (§10.2) or minification changed the line. A tool can rewrite a
 runtime traceback against the map to point at the `.luac` sources.
-
-## 11. Open questions
-
-1. **Open tables (§6.4).** The alternative is to seal every table at its
-   constructor and require a declared type for tables built up by
-   assignment. Open-until-escape keeps the module idiom
-   (`local M = {} ... return M`) free of declarations at the cost of one
-   rule.
-2. **Header generation.** Whether the compiler writes a starting `.luah` for
-   a `.luac` module from its returned value, since every required module
-   needs one (§8.4).
-3. **Standard library includes (§7.3).** Whether the standard library
-   headers stay implicit, or each library (`string`, `table`, `io`, ...) is
-   included explicitly with `#include <string.luah>`.
