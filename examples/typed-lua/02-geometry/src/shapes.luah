@@ -1,11 +1,10 @@
--- shapes: plain data and a tagged union. No methods and no metatables: the
--- `kind` field tells the shapes apart.
+-- shapes: plain data. Every kind of shape is one record with a `kind` tag,
+-- as C code does it; each kind sets the fields it uses and leaves the rest
+-- nil.
 #include "vec.luah"
 
-typedef Circle = { kind: "circle", centre: Vec, r: number }
-typedef Rect = { kind: "rect", origin: Vec, w: number, h: number }
-typedef Shape = Circle | Rect
+typedef Shape = { kind: string, at: Vec, r: number, w: number, h: number }
 
 area(s: Shape): number
 total_area(shapes: Shape[]): number
-largest(items: any[], measure: (item: any) -> number): any
+largest(shapes: Shape[]): Shape

@@ -6,7 +6,7 @@ local csv = require("csv")
 
 
 local function to_item(row     )
-  local price          = tonumber(row[2])
+  local price         = tonumber(row[2])
   if price == nil then
     return nil
   end

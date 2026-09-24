@@ -23,8 +23,8 @@ there is no way to compile a program that doesn't check.
 The compiler removes types by overwriting them with spaces (§11.1):
 
 ```lua
-local function parse(s: string): (number?, string?)   -- source
-local function parse(s        )                      -- output
+local function parse(s: string): (number, string)   -- source
+local function parse(s        )                    -- output
 ```
 
 Removed: `: Type` after names, return types, casts,

@@ -7,7 +7,8 @@ refer to the [specification](05-specification.md). Snippets leave out the
 
 ## Variables
 
-Write the type after the name, or let the value supply it:
+Write the type after the name, or let the value supply it, as C's `auto`
+does:
 
 ```lua
 local count: integer = 0
@@ -16,8 +17,8 @@ local ratio = 0.5          -- number, from the literal
 local label = name         -- string, from `name`
 ```
 
-A type taken from a value is taken once, at the declaration, and is fixed
-from then on (§6.2). Nothing looks ahead to how the variable is used:
+A type is taken once, at the declaration, and fixed from then on (§6.2).
+Nothing looks ahead to how the variable is used:
 
 ```lua
 local count = 0
@@ -25,9 +26,9 @@ count = count + 1          -- fine
 count = "many"             -- error: `string` is not compatible with `integer`
 ```
 
-A variable declared without a value starts as `nil`, so its type must say
-so: `local label: string?`. Leaving out both the type and the value is an
-error — there is nothing to take a type from.
+Any variable may hold `nil`, as in Lua. A variable declared without a value
+starts as `nil`: `local label: string`. Leaving out both the type and the
+value is an error — there is nothing to take a type from.
 
 `integer` is a whole number and fits anywhere a `number` does. `1` is an
 `integer` literal, `1.0` and `1e3` are `number`s.
@@ -52,33 +53,34 @@ end
 **Several results** are written as a list:
 
 ```lua
-local function parse(s: string): (number?, string?)
-  local n: number? = tonumber(s)
+local function parse(s: string): (number, string)
+  local n: number = tonumber(s)
   if n then return n, nil end
   return nil, "not a number: " .. s
 end
 
-local value, err = parse("42")   -- number?, string?
+local value, err = parse("42")   -- number, string
 ```
 
-**Optional arguments** are parameters whose type admits `nil`. A caller may
-leave trailing ones out:
+**Leaving out arguments** works as in Lua: missing trailing arguments are
+`nil`. Passing more arguments than a function takes is an error.
 
 ```lua
-local function pad(s: string, width: integer?): string
+local function pad(s: string, width: integer): string
   return string.rep(" ", (width or 8) - #s) .. s
 end
 
-pad("x")        -- fine
-pad("x", 4)     -- fine
+pad("x")        -- width is nil
+pad("x", 4)
 ```
 
-**Varargs** have a type too; `{ ... }` is then an array of it:
+**Varargs** are untyped, as in C. Each value from `...` is `any`, so give it
+a type before using it:
 
 ```lua
-local function sum(...: number): number
+local function sum(...): number
   local total: number = 0
-  for _, n in ipairs({ ... }) do total = total + n end
+  for _, n: number in ipairs({ ... }) do total = total + n end
   return total
 end
 ```
@@ -86,47 +88,50 @@ end
 **Function types** are written `(params) -> result`:
 
 ```lua
-local on_done: ((ok: boolean) -> void)? = nil
 typedef Compare = (a: string, b: string) -> boolean
+local on_done: (ok: boolean) -> void
 ```
 
-**Callbacks** passed where a function type is expected take their types from
-it, so they need no declarations:
+**Callbacks** are functions like any other, so they write their types:
 
 ```lua
-local on_key: (key: string) -> void = function(key)   -- key is string
-  print("pressed " .. key)
-end
+local names: string[] = { "lua", "c" }
+table.sort(names, function(a: string, b: string): boolean return a < b end)
 ```
-
-**Code for any type** works the way it does in C: it takes `any`, and the
-caller casts what comes back. There are no type parameters:
-
-```lua
-local function first(items: any[]): any
-  return items[1]
-end
-
-local s = <string?> first({ "a", "b" })
-```
-
-Every array can be passed as `any[]`, and every map as `any[any]`.
 
 A function that declares results must return on every path. Ending in
 `error(...)` counts, because `error` never returns.
 
-## Tables
+## Loops
 
-Name a table shape with `typedef`. Records list their fields:
+A numeric `for` takes its type from its start: `for i = 1, 10` makes `i` an
+`integer`. A generic `for` takes its types from the iterator. `ipairs` and
+`pairs` return `any`, so declare the variables you use (an unused `_` can
+stay `any`):
 
 ```lua
-typedef Item = { name: string, price: number, note: string? }
-
-local apple: Item = { name = "apple", price = 0.5 }   -- `note` may be left out
+for i: integer, name: string in ipairs(names) do
+  print(i, name)
+end
 ```
 
-A table written where a type is expected is checked against it exactly:
-every required field present, no extra fields, nested tables checked too.
+## Tables
+
+Name a record with `typedef`, as you would a C struct:
+
+```lua
+typedef Item = { name: string, price: number, note: string }
+
+local apple: Item = { name = "apple", price = 0.5 }   -- note is nil
+```
+
+A table written where a type is expected is checked against it: every
+field it sets must be declared, at a compatible type. Fields it leaves out
+are `nil`, like the members a C initializer leaves out.
+
+Records match by name. Two records with the same fields are different types
+unless they come from the same `typedef`, so give a record a name when it is
+passed between functions.
 
 **Arrays and maps** are written with suffixes:
 
@@ -135,12 +140,12 @@ local names: string[] = { "ada", "grace" }        -- array
 local ages: integer[string] = { ada = 36 }         -- map: string → integer
 local seen: boolean[string] = {}                   -- a set
 
-names[#names + 1] = "linus"        -- arrays and maps take new entries
-local age: integer? = ages["bob"]  -- a map lookup may miss, so it is `integer?`
+names[#names + 1] = "linus"      -- arrays and maps take new entries
+local age: integer = ages["bob"] -- nil if absent
 ```
 
-**Records do not grow.** A record's fields are fixed when it is built;
-assigning a field it doesn't have is an error (§6.5). Build tables whole:
+**Records do not grow.** A record's fields are fixed by its type; assigning
+a field it doesn't declare is an error (§6.5). Build tables whole:
 
 ```lua
 -- Not this:
@@ -151,8 +156,7 @@ M.version = "1.0"          -- error: `{}` has no field `version`
 return { version = "1.0", area = area }
 ```
 
-Assigning `nil` to a field is allowed only if the field's type admits it. A
-record that also takes arbitrary keys says so with an index part:
+A record that also takes arbitrary keys says so with an index part:
 `{ name: string, [string]: any }`.
 
 ## Objects
@@ -178,18 +182,15 @@ end
 print(new(3, 4):len())   -- 5
 ```
 
-`setmetatable` adds the fields of `__index` to the table's type, which is
-why `{ x = x, y = y }` becomes a `Vec` (§6.7). Operators are not
-overloadable: write `add(a, b)`, not `a + b`, even if the metatable has
-`__add`.
+The constructor passed to `setmetatable` needs only the fields `__index`
+does not supply (§6.7). Operators are not overloadable: write `add(a, b)`,
+not `a + b`, even if the metatable has `__add`.
 
-When functions need each other before they are all defined, forward-declare
-the one used early (§6.3):
+When functions need each other before they are all defined, declare one
+first and define it later, as with a C prototype:
 
 ```lua
-typedef Vec = { x: number, y: number, scale: (self: Vec, k: number) -> Vec }
-
-local new: (x: number, y: number) -> Vec     -- declared, defined below
+local new: (x: number, y: number) -> Vec       -- nil until defined below
 
 local function scale(self: Vec, k: number): Vec
   return new(self.x * k, self.y * k)
@@ -200,40 +201,13 @@ function new(x: number, y: number): Vec
 end
 ```
 
-## Unions and narrowing
+## Kinds of record
 
-`A | B` is either type, and `T?` is `T | nil`. Before using a union as one
-of its members, check which one it is; the check narrows the type inside the
-branch (§6.9):
-
-```lua
-local function describe(v: string | number): string
-  if type(v) == "number" then
-    return "number " .. v        -- v is number
-  end
-  return "string " .. v          -- v is string
-end
-```
-
-A `nil` check is the most common narrowing, and an early return narrows the
-rest of the function:
+Data that comes in several kinds is one record with a tag field, the way C
+code does it. Each kind uses the fields it needs; the others stay `nil`:
 
 ```lua
-local function upper_name(item: Item?): string
-  if not item then
-    return "(none)"
-  end
-  return string.upper(item.name) -- item is Item from here on
-end
-```
-
-**Tagged unions** are records with a literal `kind` field. Comparing it
-narrows to the matching member:
-
-```lua
-typedef Circle = { kind: "circle", r: number }
-typedef Rect = { kind: "rect", w: number, h: number }
-typedef Shape = Circle | Rect
+typedef Shape = { kind: string, r: number, w: number, h: number }
 
 local function area(s: Shape): number
   if s.kind == "circle" then
@@ -241,48 +215,67 @@ local function area(s: Shape): number
   end
   return s.w * s.h
 end
+
+local shapes: Shape[] = {
+  { kind = "circle", r = 1 },
+  { kind = "rect", w = 3, h = 4 },
+}
 ```
 
-Narrowing applies to locals and parameters. To narrow a field, copy it into
-a local first:
+## `any` and casts
+
+`any` is a value whose type isn't known, like `void *` in C. It comes from
+`...`, `pcall`, `dofile`, a computed `require`, and code written to work on
+any type. An `any` converts to a declared type without ceremony, but
+nothing can be done with it until it has one:
 
 ```lua
-local note = item.note
-if note then
-  print(string.upper(note))
+local config: Config = dofile("config.lua")   -- fine: converted
+print(config.host)
+print(dofile("config.lua").host)              -- error: field of `any`
+```
+
+A cast `<T> e` gives an expression a type in place. As in C, it is not
+checked: it is where you vouch for the value.
+
+```lua
+print((<Config> dofile("config.lua")).host)
+```
+
+Code that works on any type takes and returns `any`, and callers convert:
+
+```lua
+local function first(items: any[]): any
+  return items[1]
 end
+
+local s: string = first(names)
 ```
 
 ## Errors
 
 `error(...)` never returns, so it ends a path like `return` does.
-`assert(x, "message")` narrows `x` for the statements after it.
-`pcall(f, ...)` returns `boolean` and then `any` results; cast them once
-you know what they are.
-
-The Lua convention of returning `nil, message` on failure types naturally as
-`(T?, string?)`.
-
-## Escape hatches
-
-- `any` accepts and allows everything. Use it where types genuinely don't
-  apply; it is visible in the source, never implied.
-- `unknown` accepts everything but allows nothing until you narrow or cast
-  it. Prefer it to `any` for values you will check.
-- `<T> e` casts `e` to `T`. It is checked: casting between unrelated types
-  is an error. Casting from `any` or `unknown` is always allowed.
+`pcall(f, ...)` returns a `boolean` and then `any` values:
 
 ```lua
-local config = <{ host: string, port: integer }> decode(text)  -- decode returns unknown
+local ok, result = pcall(parse_config, text)
+if ok then
+  local config: Config = result
+end
 ```
+
+The Lua convention of returning `nil, message` on failure types as
+`(T, string)`.
 
 ## Porting a Lua file
 
 1. Rename it `.luac` and write a header for it if other modules require it.
-2. Add types to every function's parameters and results.
+2. Add types to every function's parameters and results, and to generic
+   `for` variables.
 3. Replace build-up tables (`local M = {}` then `M.f = …`) with one
    constructor.
-4. Add `#include` lines for the libraries it uses and the modules it
+4. Give records that are passed around a `typedef`.
+5. Add `#include` lines for the libraries it uses and the modules it
    requires.
-5. Rename anything called `typedef`.
-6. Compile, and fix what it reports.
+6. Rename anything called `typedef`.
+7. Compile, and fix what it reports.

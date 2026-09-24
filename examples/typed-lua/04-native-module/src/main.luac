@@ -3,7 +3,7 @@
 
 local socket = require("socket.core")
 
-local function fetch_status(host: string): (string?, string?)
+local function fetch_status(host: string): (string, string)
   local conn, err = socket.connect(host, 80)
   if not conn then
     return nil, err

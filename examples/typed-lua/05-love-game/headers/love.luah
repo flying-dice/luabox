@@ -1,16 +1,13 @@
 -- love.luah: the slice of the LÖVE API this game uses. LÖVE provides `love`
--- as a global, so it is declared `extern`. The callbacks are optional fields
--- the game fills in; LÖVE calls whichever ones are set.
-
-typedef DrawMode = "fill" | "line"
-typedef Key = "left" | "right" | "up" | "down" | "escape"
+-- as a global, so it is declared `extern`. The callbacks are fields the game
+-- fills in; LÖVE calls whichever ones are set.
 
 typedef LoveGraphics = {
-  rectangle: (mode: DrawMode, x: number, y: number, w: number, h: number) -> void,
+  rectangle: (mode: string, x: number, y: number, w: number, h: number) -> void,
   print: (text: string, x: number, y: number) -> void,
 }
 
-typedef LoveKeyboard = { isDown: (key: Key) -> boolean }
+typedef LoveKeyboard = { isDown: (key: string) -> boolean }
 
 typedef LoveEvent = { quit: () -> void }
 
@@ -18,9 +15,9 @@ typedef Love = {
   graphics: LoveGraphics,
   keyboard: LoveKeyboard,
   event: LoveEvent,
-  load: (() -> void)?,
-  update: ((dt: number) -> void)?,
-  draw: (() -> void)?,
+  load: () -> void,
+  update: (dt: number) -> void,
+  draw: () -> void,
 }
 
 extern love: Love

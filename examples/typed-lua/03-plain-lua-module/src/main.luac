@@ -5,8 +5,8 @@ local csv = require("csv")
 
 typedef Item = { name: string, price: number }
 
-local function to_item(row: Row): Item?
-  local price: number? = tonumber(row[2])
+local function to_item(row: Row): Item
+  local price: number = tonumber(row[2])
   if price == nil then
     return nil
   end

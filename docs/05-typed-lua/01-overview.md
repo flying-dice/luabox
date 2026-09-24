@@ -41,13 +41,13 @@ matches the source. An error at runtime points at the line you wrote.
 
 ## The idea in five rules
 
-1. **Types follow names.** `local x: number`,
+1. **Types follow names; the rest is C.** `local x: number`,
    `local function area(r: Rect): number`,
    `typedef Point = { x: number, y: number }`. Every Lua program still
    parses exactly as it does in Lua.
 2. **Types are written, not guessed.** A variable's type is what you wrote,
-   or what the right-hand side already has — `local n = 1` is an `integer`.
-   Nothing is ever worked out from how a value is used later.
+   or what the right-hand side already has — `local n = 1` is an `integer`,
+   as with C's `auto`. Nothing is worked out from how a value is used later.
 3. **Modules have headers.** `geometry.luah` declares what `geometry` offers.
    Code that uses it writes `#include "geometry.luah"`, the same as C. Plain
    Lua libraries and native `.dll`/`.so` modules get headers too.
@@ -55,16 +55,17 @@ matches the source. An error at runtime points at the line you wrote.
    builds it. You build a table whole, in one `{ … }`, which is also the
    fastest way to build one in Lua.
 5. **Always strict.** Every error stops compilation. There is no lenient
-   mode and no comment that silences an error. `any` is the one, visible,
-   escape hatch.
+   mode and no comment that silences an error. `any` and casts are the
+   escape hatches, and both are visible in the source.
 
 ## What it leaves out
 
 No classes, interfaces, enums, inheritance, access modifiers, generics,
-overloading, operator overloading, decorators, namespaces, macros or
-conditional compilation. The rule: a feature is in Typed Lua only if Lua or
-C already has it. Lua already has tables, metatables, closures and modules;
-Typed Lua types those and adds nothing that would need runtime support.
+overloading, operator overloading, union types, nullable types, flow
+typing, decorators, namespaces, macros or conditional compilation. The
+rule: a feature is in Typed Lua only if Lua or C already has it. Lua already
+has tables, metatables, closures and modules; Typed Lua types those and adds
+nothing that would need runtime support.
 
 ## File kinds
 
@@ -77,7 +78,7 @@ Typed Lua types those and adds nothing that would need runtime support.
 ## Read next
 
 - [Writing Typed Lua](02-writing-typed-lua.md) — the everyday idioms:
-  objects, modules, unions, callbacks, optional arguments, errors.
+  objects, modules, tagged records, callbacks, `any`, errors.
 - [Headers](03-headers.md) — interfaces for your modules, for plain Lua,
   for native libraries and for host globals.
 - [Building](04-building.md) — compiling, targeting older Lua, bundling and
@@ -111,9 +112,18 @@ away on purpose.
   still cannot be added with `+`; you call `vec.add(a, b)`. Operators mean
   exactly one thing, and nothing about a type depends on metamethods other
   than `__index`.
-- **Narrowing works on locals, not fields.** `if p.label then` does not
-  narrow `p.label`; copy it into a local first. This keeps the rule sound
-  without tracking which fields might change between the check and the use.
+- **`nil` is not checked.** Every type admits `nil`, as every Lua variable
+  and every C pointer does. The checker catches wrong types, unknown fields,
+  wrong argument counts and misspelt globals, but not a missing `nil`
+  check. That keeps the type system to what C has: no nullable types, no
+  unions, no narrowing.
+- **`any` works like `void *`.** Values of unknown type — from `dofile`,
+  `pcall`, `...`, or code that works on any type — are `any`. They convert
+  to a declared type freely, but nothing can be done with them until they
+  are converted or cast. Casts are not checked, as in C.
+- **Records match by name.** Two record types with the same fields are
+  still different types unless they come from the same `typedef`, as with
+  C structs. A table passed around is declared with a named type.
 - **The standard library is included explicitly.** `#include <string.luah>`
   before using `string`. Only the base functions (`print`, `pairs`, `type`,
   `require` and so on) are always there.

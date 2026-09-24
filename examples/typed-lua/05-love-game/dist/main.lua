@@ -7,21 +7,20 @@
 local player         = { x = 150, y = 110, size = 20, speed = 160 }
 
 -- The direction each key moves the player in.
-local dx              = { left = -1, right = 1 }
-local dy              = { up = -1, down = 1 }
+local dx                 = { left = -1, right = 1 }
+local dy                 = { up = -1, down = 1 }
 
 function love.load()
   player.x, player.y = 150, 110
 end
 
--- `dt` takes its type, number, from the `update` field.
-function love.update(dt)
-  for key, step in pairs(dx) do
+function love.update(dt        )
+  for key        , step         in pairs(dx) do
     if love.keyboard.isDown(key) then
       player.x = player.x + step * player.speed * dt
     end
   end
-  for key, step in pairs(dy) do
+  for key        , step         in pairs(dy) do
     if love.keyboard.isDown(key) then
       player.y = player.y + step * player.speed * dt
     end

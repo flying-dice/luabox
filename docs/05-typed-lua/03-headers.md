@@ -27,11 +27,11 @@ module's value — `require("geometry").area`, `.unit` and `.version` above.
 
 There is one prototype per name, because a Lua function is one function.
 A function called in several forms checks its arguments at runtime, so its
-prototype covers every form with optional parameters and unions:
+prototype covers every form; a position that takes different types is `any`:
 
 ```lua
 -- table.luah: insert(t, v) and insert(t, pos, v)
-insert(list: any[], pos_or_value: any, value: any?)
+insert(list: any, pos_or_value: any, value: any)
 ```
 
 A module whose value is not a table says what it is with `return`:
@@ -111,11 +111,11 @@ header after the module: `require("socket.core")` is declared by
 ```lua
 -- headers/socket/core.luah
 typedef Socket = {
-  send: (self: Socket, data: string) -> (integer?, string?),
+  send: (self: Socket, data: string) -> (integer, string),
   close: (self: Socket) -> void,
 }
 
-connect(host: string, port: integer): (Socket?, string?)
+connect(host: string, port: integer): (Socket, string)
 ```
 
 A native module's objects are usually userdata with a metatable. Describe
@@ -129,13 +129,13 @@ provides:
 ```lua
 -- love.luah
 typedef LoveGraphics = {
-  rectangle: (mode: "fill" | "line", x: number, y: number, w: number, h: number) -> void,
+  rectangle: (mode: string, x: number, y: number, w: number, h: number) -> void,
 }
 
 typedef Love = {
   graphics: LoveGraphics,
-  update: ((dt: number) -> void)?,
-  draw: (() -> void)?,
+  update: (dt: number) -> void,
+  draw: () -> void,
 }
 
 extern love: Love
@@ -143,20 +143,20 @@ extern love: Love
 
 Reading or writing a global that no included header declares is an error,
 so a typo in a global name is caught. A program defines a callback by
-assigning a declared field; the function takes its types from the field:
+assigning a declared field, with the field's types:
 
 ```lua
 #include <love.luah>
 
-function love.update(dt)     -- dt is number
+function love.update(dt: number)
 end
 ```
 
 ## Loading files at runtime
 
 `dofile`, `loadfile` and `load` take a path or a string at runtime, so no
-header can be found for them. Their results are `unknown`. Declare the shape
-in a header and cast once, where the file is loaded:
+header can be found for them. Their results are `any`, like C's `void *`.
+Declare the shape in a header and convert to it where the file is loaded:
 
 ```lua
 -- config.luah
@@ -166,12 +166,12 @@ typedef Config = { host: string, port: integer }
 ```lua
 #include "config.luah"
 
-local config = <Config> dofile("config.lua")   -- typed from here on
+local config: Config = dofile("config.lua")   -- typed from here on
 print(config.host)
 ```
 
-The cast is the one place you vouch for the file's contents; everything
-after it is checked.
+That declaration is the one place you vouch for the file's contents;
+everything after it is checked.
 
 ## Finding headers
 

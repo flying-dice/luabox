@@ -3,27 +3,26 @@
 
 local function area(s: Shape): number
   if s.kind == "circle" then
-    return math.pi * s.r ^ 2 -- s is a Circle here
+    return math.pi * s.r ^ 2
   end
-  return s.w * s.h -- and a Rect here
+  return s.w * s.h
 end
 
 local function total_area(shapes: Shape[]): number
   local total: number = 0
-  for _, s in ipairs(shapes) do
+  for _, s: Shape in ipairs(shapes) do
     total = total + area(s)
   end
   return total
 end
 
--- Works on any array, so it takes `any` and callers cast the result.
-local function largest(items: any[], measure: (item: any) -> number): any
-  local best: any = nil
-  local best_size: number = -math.huge
-  for _, item in ipairs(items) do
-    local size = measure(item)
-    if size > best_size then
-      best, best_size = item, size
+local function largest(shapes: Shape[]): Shape
+  local best: Shape = nil
+  local best_area: number = -math.huge
+  for _, s: Shape in ipairs(shapes) do
+    local a = area(s)
+    if a > best_area then
+      best, best_area = s, a
     end
   end
   return best
