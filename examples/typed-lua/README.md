@@ -20,7 +20,7 @@ anything newer. When the compiler lands, these become its golden tests.
 | Example                                           | Shows                                                         |
 |---------------------------------------------------|---------------------------------------------------------------|
 | [01-hello](01-hello/)                             | typed locals, a typed function, a typed loop, a library include |
-| [02-geometry](02-geometry/)                       | modules with headers, metatable objects, a tagged union, generics, a forward declaration |
+| [02-geometry](02-geometry/)                       | modules with headers, metatable objects, a tagged union, `any` plus a cast, a forward declaration |
 | [03-plain-lua-module](03-plain-lua-module/)       | using an existing `.lua` module through a header you write     |
 | [04-native-module](04-native-module/)             | a header for a native library, multiple returns, narrowing     |
 | [05-love-game](05-love-game/)                     | `extern` globals from a host (LÖVE), callbacks typed by their field, maps keyed by a literal union |
@@ -41,7 +41,8 @@ Three modules, two with headers:
   `setmetatable` gives the table the methods from `__index` (§6.7). `scale`
   calls `new` before `new` is written, so `new` is forward-declared (§6.3).
 - `shapes.luah` / `shapes.luac` — plain data. `Shape` is a union told apart
-  by the `kind` field, and `area` narrows on it (§6.9). `largest` is generic.
+  by the `kind` field, and `area` narrows on it (§6.9). `largest` works on
+  any array, so it takes `any[]` and `main.luac` casts its result.
 - `main.luac` — requires both through their headers. Each table in `scene`
   is checked against the `Shape` member its `kind` selects.
 

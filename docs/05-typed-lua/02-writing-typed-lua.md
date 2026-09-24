@@ -87,27 +87,30 @@ end
 
 ```lua
 local on_done: ((ok: boolean) -> void)? = nil
-typedef Compare<T> = (a: T, b: T) -> boolean
+typedef Compare = (a: string, b: string) -> boolean
 ```
 
 **Callbacks** passed where a function type is expected take their types from
 it, so they need no declarations:
 
 ```lua
-local names: string[] = { "lua", "c" }
-table.sort(names, function(a, b) return a < b end)   -- a, b are string
+local on_key: (key: string) -> void = function(key)   -- key is string
+  print("pressed " .. key)
+end
 ```
 
-**Generic functions** name their type parameters after the function name.
-The arguments decide what the parameters stand for at each call:
+**Code for any type** works the way it does in C: it takes `any`, and the
+caller casts what comes back. There are no type parameters:
 
 ```lua
-local function first<T>(items: T[]): T?
+local function first(items: any[]): any
   return items[1]
 end
 
-local s: string? = first({ "a", "b" })   -- T is string
+local s = <string?> first({ "a", "b" })
 ```
+
+Every array can be passed as `any[]`, and every map as `any[any]`.
 
 A function that declares results must return on every path. Ending in
 `error(...)` counts, because `error` never returns.

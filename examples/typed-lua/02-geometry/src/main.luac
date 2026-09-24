@@ -16,8 +16,8 @@ print("length", v:len())
 print("scaled", v:scale(2):len())
 print("total area", string.format("%.2f", shapes.total_area(scene)))
 
--- T is bound to Shape by `scene`; `shapes.area` fits (s: Shape) -> number.
-local big: Shape? = shapes.largest(scene, shapes.area)
+-- `largest` returns `any`; the cast says what this call gives back.
+local big = <Shape?> shapes.largest(scene, shapes.area)
 if big then
   print("largest", big.kind)
 end

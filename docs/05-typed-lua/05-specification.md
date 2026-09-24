@@ -1,6 +1,6 @@
 # Typed Lua — Language Specification
 
-Draft 7. Status: proposed.
+Draft 8. Status: proposed.
 
 This document is normative. The guides in this section teach the language;
 where they and this document differ, this document governs.
@@ -45,8 +45,9 @@ end
 ### 1.2 Non-goals
 
 Typed Lua has no classes, interfaces, enums, access modifiers, decorators,
-namespaces, abstract members, overloading, operator overloading, or any
-construct with runtime meaning of its own. It has no macros and no
+namespaces, abstract members, generics, overloading, operator overloading,
+or any construct with runtime meaning of its own. A feature is included
+only when Lua or C already has it. It has no macros and no
 conditional compilation. Idioms Lua already has — tables, metatables,
 closures, modules returned from a chunk — are what programs use.
 
@@ -111,24 +112,22 @@ Suffix       ::= '?'                            -- optional
                | '[' ']'                        -- array
                | '[' Type ']'                   -- map
 PrimaryType  ::= 'nil' | 'true' | 'false' | String | Numeral
-               | Name [TypeArgs]
+               | Name
                | RecordType
                | FunctionType
                | '(' Type ')'
-TypeArgs     ::= '<' Type {',' Type} '>'
 
 RecordType   ::= '{' [Field {',' Field} [',']] '}'
 Field        ::= Name ':' Type                  -- named field
                | '[' String ']' ':' Type        -- field whose key is not a name
                | '[' Type ']' ':' Type          -- index part (§6.5)
 
-FunctionType ::= [Generics] '(' [FnParams] ')' '->' ReturnType
+FunctionType ::= '(' [FnParams] ')' '->' ReturnType
 FnParams     ::= FnParam {',' FnParam} [',' '...' ':' Type]
                | '...' ':' Type
 FnParam      ::= [Name ':'] Type
 ReturnType   ::= Type
                | '(' Type ',' Type {',' Type} [',' '...' ':' Type] ')'
-Generics     ::= '<' Name {',' Name} '>'
 ```
 
 | Written                         | Meaning                                          |
@@ -173,12 +172,12 @@ local label: string?
 ### 4.3 Functions
 
 Parameter types follow the parameters; the return type follows the
-parameter list. Type parameters follow the function's name.
+parameter list.
 
 ```
-function-stat  ::= 'function' funcname [Generics] funcbody
-local-function ::= 'local' 'function' Name [Generics] funcbody
-function-lit   ::= 'function' [Generics] funcbody
+function-stat  ::= 'function' funcname funcbody
+local-function ::= 'local' 'function' Name funcbody
+function-lit   ::= 'function' funcbody
 funcbody       ::= '(' [parlist] ')' [':' ReturnType] block 'end'
 parlist        ::= param {',' param} [',' vararg] | vararg
 param          ::= Name [':' Type]
@@ -196,7 +195,7 @@ local function parse(s: string): (number?, string?)
   return nil, "not a number: " .. s
 end
 
-local function each<T>(list: T[], f: (item: T) -> void)
+local function each(list: string[], f: (item: string) -> void)
   for _, item in ipairs(list) do f(item) end
 end
 
@@ -219,15 +218,14 @@ with the precedence of `not`, `#` and unary `-`.
 ### 4.5 Type definitions
 
 ```
-stat ::= ... | 'typedef' Name [Generics] '=' Type
+stat ::= ... | 'typedef' Name '=' Type
 ```
 
 ```lua
 typedef Point = { x: number, y: number }
-typedef Pair<A, B> = { first: A, second: B }
 typedef DrawMode = "fill" | "line"
 typedef Logger = (message: string) -> void
-typedef List<T> = { value: T, next: List<T>? }
+typedef Node = { value: number, next: Node? }
 ```
 
 ### 4.6 Reading Typed Lua beside Lua
@@ -296,8 +294,8 @@ target declares, each at a compatible type; a field whose target type admits
 fewer, except where a table constructor is checked directly (§6.5).
 
 `S[]` is compatible with `T[]`, and `V[K]` with `W[L]`, only when the element
-types are the same type: a table that can be written through is not
-covariant.
+types are the same type — a table that can be written through is not
+covariant — or when the target is `any[]` or `any[any]` (§5.4).
 
 ### 5.3 Function types
 
@@ -307,14 +305,21 @@ with `S` (returns are covariant). A function taking fewer parameters is
 compatible with one taking more; the extra arguments are ignored, as in Lua.
 A function returning values is compatible with one returning `void`.
 
-### 5.4 Generics
+### 5.4 Code for values of any type
 
-Functions and `typedef`s may declare type parameters. At a call, each type
-parameter is bound by the first argument whose parameter type mentions it;
-later arguments are checked against the bound type. A type parameter that
-no argument binds is an error at the call. Type parameters have no
-constraints. A generic `typedef` is always written with its arguments:
-`Pair<string, number>`.
+There are no type parameters. Code that works on values of any type takes
+`any` or `unknown`, and its caller casts the result (§6.10):
+
+```lua
+local function largest(items: any[], measure: (item: any) -> number): any
+  -- ...
+end
+
+local big = <Shape?> largest(scene, area)
+```
+
+Every array is compatible with `any[]`, and every map with `any[any]`, so
+such functions accept any array or map.
 
 ### 5.5 Integers
 
@@ -409,10 +414,9 @@ returned value — takes its parameter and return types from that type and
 need not write them. An expected type `F?` gives a literal the types of `F`.
 
 ```lua
-#include <table.luah>
-
-local names: string[] = { "lua", "c" }
-table.sort(names, function(a, b) return a < b end)   -- a, b are string
+local on_key: (key: string) -> void = function(key)   -- key is string
+  print("pressed " .. key)
+end
 ```
 
 Recursion needs no special rule: a function's signature is known before its
@@ -625,8 +629,7 @@ As in Lua, except for globals (§7.3).
 
 A `typedef` is visible throughout the block that contains it, including
 before it and inside its own definition, so types may be recursive and
-mutually recursive. Type parameters are visible throughout their
-declaration. Two `typedef`s of one name in one block are an error; an inner
+mutually recursive. Two `typedef`s of one name in one block are an error; an inner
 block may shadow an outer name.
 
 Types from an included header are visible from the `#include` line to the
@@ -650,10 +653,10 @@ compiled and produce no output.
 ```
 header ::= {hstat}
 hstat  ::= include
-         | 'typedef' Name [Generics] '=' Type
-         | Name [Generics] '(' [FnParams] ')' [':' ReturnType]  -- function
+         | 'typedef' Name '=' Type
+         | Name '(' [FnParams] ')' [':' ReturnType]             -- function
          | Name ':' Type                                        -- field
-         | 'extern' Name [Generics] '(' [FnParams] ')' [':' ReturnType]
+         | 'extern' Name '(' [FnParams] ')' [':' ReturnType]
          | 'extern' Name ':' Type
          | 'return' Type
 ```
@@ -661,6 +664,11 @@ hstat  ::= include
 A function prototype declares a function by signature alone — no
 `function`, no body, no `end`. Every parameter must have a type; a missing
 return type means `void`. `--` comments are allowed anywhere.
+
+Each name has one prototype, because a Lua function is one function. A
+function that Lua code calls in several forms — `table.insert(t, v)` and
+`table.insert(t, pos, v)` — inspects its arguments at runtime; its prototype
+covers every form with optional parameters and unions.
 
 ```lua
 -- socket/core.luah
@@ -802,17 +810,17 @@ Their types:
 | `tostring`        | `(v: any) -> string`                                                |
 | `tonumber`        | `(v: any, base: integer?) -> number?`                               |
 | `error`           | `(message: any, level: integer?) -> never`                          |
-| `assert`          | `<T>(v: T, message: any) -> T`, narrowing as in §6.9                |
+| `assert`          | returns `v` without `nil` and `false`, and narrows `v` (§6.9)       |
 | `pcall`           | `(f: (...: any) -> any, ...: any) -> (boolean, ...: any)`           |
 | `xpcall`          | `(f: (...: any) -> any, handler: (err: any) -> any, ...: any) -> (boolean, ...: any)` |
 | `select`          | `select("#", ...)` is `integer`; `select(i, ...)` per §6.4          |
 | `ipairs`, `pairs` | loop iterators, typed per §6.2                                      |
-| `next`            | `<K, V>(t: V[K], key: K?) -> (K?, V)`                               |
+| `next`            | `(t: any[any], key: any) -> (any, any)`                             |
 | `setmetatable`    | per §6.7                                                            |
 | `getmetatable`    | `(v: any) -> unknown`                                               |
 | `rawget`, `rawset`, `rawequal`, `rawlen` | as their Lua counterparts, over `any`        |
 | `require`         | per §6.11                                                           |
-| `unpack` (5.1)    | `<T>(list: T[], i: integer?, j: integer?) -> (...: T)`              |
+| `unpack` (5.1)    | `(list: any[], i: integer?, j: integer?) -> (...: any)`             |
 | `dofile`          | `(path: string?) -> (...: unknown)`, per §6.12                      |
 | `loadfile`        | `(path: string?, ...: any) -> (Chunk?, string?)`, per §6.12         |
 | `load`, `loadstring` | `(chunk: string \| (() -> string?), ...: any) -> (Chunk?, string?)` |
@@ -878,7 +886,6 @@ Compiling a `.luac` file replaces every type-only construct with spaces:
 
 - `: Type` after a declared name, parameter, vararg or loop variable;
 - `: ReturnType` after a function's parameter list;
-- `<...>` type parameter lists;
 - `<T>` casts;
 - entire `typedef` statements;
 - `#include` lines.

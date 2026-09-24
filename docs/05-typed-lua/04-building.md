@@ -27,7 +27,7 @@ local function parse(s: string): (number?, string?)   -- source
 local function parse(s        )                      -- output
 ```
 
-Removed: `: Type` after names, return types, type parameter lists, casts,
+Removed: `: Type` after names, return types, casts,
 whole `typedef` statements and `#include` lines. Newlines inside a removed
 region stay. The output has exactly the source's lines, and every token that
 remains is at the same line and column — so a runtime error message, a

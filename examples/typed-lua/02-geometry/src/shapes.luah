@@ -8,4 +8,4 @@ typedef Shape = Circle | Rect
 
 area(s: Shape): number
 total_area(shapes: Shape[]): number
-largest<T>(items: T[], measure: (item: T) -> number): T?
+largest(items: any[], measure: (item: any) -> number): any

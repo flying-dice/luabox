@@ -25,6 +25,15 @@ no body. A prototype with no return type returns nothing. Everything a
 header declares that is not a `typedef` or `extern` is a field of the
 module's value — `require("geometry").area`, `.unit` and `.version` above.
 
+There is one prototype per name, because a Lua function is one function.
+A function called in several forms checks its arguments at runtime, so its
+prototype covers every form with optional parameters and unions:
+
+```lua
+-- table.luah: insert(t, v) and insert(t, pos, v)
+insert(list: any[], pos_or_value: any, value: any?)
+```
+
 A module whose value is not a table says what it is with `return`:
 
 ```lua

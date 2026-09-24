@@ -60,9 +60,10 @@ matches the source. An error at runtime points at the line you wrote.
 
 ## What it leaves out
 
-No classes, interfaces, enums, inheritance, access modifiers, overloading,
-operator overloading, decorators, namespaces, macros or conditional
-compilation. Lua already has tables, metatables, closures and modules;
+No classes, interfaces, enums, inheritance, access modifiers, generics,
+overloading, operator overloading, decorators, namespaces, macros or
+conditional compilation. The rule: a feature is in Typed Lua only if Lua or
+C already has it. Lua already has tables, metatables, closures and modules;
 Typed Lua types those and adds nothing that would need runtime support.
 
 ## File kinds

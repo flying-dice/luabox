@@ -16,8 +16,9 @@ local function total_area(shapes         )
   return total
 end
 
-local function largest   (items     , measure                     )
-  local best     = nil
+-- Works on any array, so it takes `any` and callers cast the result.
+local function largest(items       , measure                       )
+  local best      = nil
   local best_size         = -math.huge
   for _, item in ipairs(items) do
     local size = measure(item)
