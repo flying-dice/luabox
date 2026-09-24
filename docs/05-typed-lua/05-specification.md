@@ -1,6 +1,6 @@
 # Typed Lua — Language Specification
 
-Draft 6. Status: proposed.
+Draft 7. Status: proposed.
 
 This document is normative. The guides in this section teach the language;
 where they and this document differ, this document governs.
@@ -599,6 +599,22 @@ gives it a type:
 local json = <{ encode: (value: any) -> string }> require(backend)
 ```
 
+### 6.12 Loading code at runtime
+
+`dofile`, `loadfile`, `load` and `loadstring` run code chosen by a path or a
+string at runtime, which no header can describe. Their results are
+`unknown` (§9.1), and a cast gives them a type, usually one declared in a
+header:
+
+```lua
+#include "config.luah"          -- typedef Config = { host: string, port: integer }
+
+local config = <Config> dofile("config.lua")
+print(config.host)
+```
+
+A header is never looked up from a path passed to these functions.
+
 ## 7. Scope of names
 
 ### 7.1 Values
@@ -797,10 +813,14 @@ Their types:
 | `rawget`, `rawset`, `rawequal`, `rawlen` | as their Lua counterparts, over `any`        |
 | `require`         | per §6.11                                                           |
 | `unpack` (5.1)    | `<T>(list: T[], i: integer?, j: integer?) -> (...: T)`              |
+| `dofile`          | `(path: string?) -> (...: unknown)`, per §6.12                      |
+| `loadfile`        | `(path: string?, ...: any) -> (Chunk?, string?)`, per §6.12         |
+| `load`, `loadstring` | `(chunk: string \| (() -> string?), ...: any) -> (Chunk?, string?)` |
 
-The remaining base functions of the target (`collectgarbage`, `dofile`,
-`load`, `loadfile`, `loadstring` where present) are declared with `any`
-parameters and results.
+`Chunk` is `(...: any) -> (...: unknown)`: a loaded chunk, whose results are
+`unknown` until cast. `load` accepts only the forms the target's Lua
+accepts, and `loadstring` exists only on 5.1 and LuaJIT. `collectgarbage`
+is declared with `any` parameters and result.
 
 ### 9.2 Library headers
 

@@ -143,6 +143,27 @@ function love.update(dt)     -- dt is number
 end
 ```
 
+## Loading files at runtime
+
+`dofile`, `loadfile` and `load` take a path or a string at runtime, so no
+header can be found for them. Their results are `unknown`. Declare the shape
+in a header and cast once, where the file is loaded:
+
+```lua
+-- config.luah
+typedef Config = { host: string, port: integer }
+```
+
+```lua
+#include "config.luah"
+
+local config = <Config> dofile("config.lua")   -- typed from here on
+print(config.host)
+```
+
+The cast is the one place you vouch for the file's contents; everything
+after it is checked.
+
 ## Finding headers
 
 - `#include "file.luah"` looks next to the including file first, then in
