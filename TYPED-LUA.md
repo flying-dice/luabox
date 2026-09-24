@@ -1,6 +1,6 @@
 # Typed Lua — Language Specification
 
-Draft 1.
+Draft 2.
 
 ## 1. Overview
 
@@ -32,14 +32,16 @@ metatables, closures, modules returned from a chunk — are what programs use.
 
 ## 2. Source files
 
-| Extension   | Contents                                                        |
-|-------------|-----------------------------------------------------------------|
-| `.tlua`     | Typed Lua source. Compiles to a `.lua` file.                    |
-| `.d.tlua`   | Declarations only (§8): types for code written in plain Lua.    |
-| `.lua`      | Plain Lua. May be required from Typed Lua through declarations. |
+| Extension | Contents                                                           |
+|-----------|--------------------------------------------------------------------|
+| `.luac`   | Typed Lua source. Always strictly checked; compiles to `.lua`.     |
+| `.luah`   | A header (§8): declares a module or globals implemented elsewhere. |
+| `.lua`    | Plain Lua. Usable from Typed Lua through a header.                 |
 
-A `.tlua` file is a chunk, exactly as a `.lua` file is: `require` finds it by
-module name, and the chunk's `return` value is the module.
+A `.luac` file is a chunk, exactly as a `.lua` file is: `require` finds it by
+module name, and the chunk's `return` value is the module. Compiling
+`src/geometry.luac` produces `geometry.lua`, which plain Lua loads with
+`require("geometry")`.
 
 ## 3. Lexical additions
 
@@ -50,7 +52,7 @@ only at the start of a statement and followed by a name:
   function call.
 - `export` — only in `export type` (§7.4).
 
-A third, `declare`, is contextual in `.d.tlua` files only (§8).
+A third, `declare`, is contextual in `.luah` headers only (§8).
 
 New tokens: `->` (function type arrow), `::` (type assertion), `?` (optional
 suffix). `<` and `>` delimit generic parameter lists in the
@@ -339,9 +341,9 @@ between unrelated types is an error. `any` is the only unchecked escape.
 ### 6.10 Modules
 
 `require("name")` has the type of the named module's returned value. For a
-`.tlua` module, that is the type its chunk returns. For a `.lua` module, it
-is the type its declaration file gives (§8); without one, the result is
-`unknown`, and binding it requires an annotation:
+`.luac` module, that is the type its chunk returns. For any other module —
+plain Lua or native — it is the type its header gives (§8); without one, the
+result is `unknown`, and binding it requires an annotation:
 
 ```lua
 local json: { encode: (value: any) -> string } = require("json")
@@ -364,7 +366,7 @@ recursive). Type parameters are visible inside their declaration.
 
 ### 7.3 Globals
 
-A global's type is declared by a declaration file (§8) or by its first
+A global's type is declared by a header (§8.2) or by its first
 assignment in a chunk, which must have a known type. Reading a global with
 no declared type is an error.
 
@@ -378,25 +380,96 @@ local geometry = require("geometry")
 local p: geometry.Point = { x = 0, y = 0 }
 ```
 
-## 8. Declaration files
+## 8. Headers
 
-A `.d.tlua` file declares the types of code written in plain Lua. It
-contains only `type`, `export type` and `declare` statements:
+A `.luah` header declares the types of something Typed Lua cannot see the
+source of: a module written in plain Lua, a native module loaded from a
+shared library (`.dll`, `.so`, `.dylib`), or globals a host application
+provides. Headers contain declarations only; they are never compiled and
+produce no output.
+
+### 8.1 Module headers
+
+A header is found the way `require` finds a module, with `.luah` in place of
+the module's own extension: `require("socket.core")` is declared by
+`socket/core.luah`, whether the implementation is `socket/core.lua` or the
+native `socket/core.dll`. A header next to the file it declares, or in a
+directory the project lists as a header path, is found.
+
+The module's type is the record of the header's `export` declarations:
 
 ```
-stat ::= 'declare' Name ':' Type                    -- a global value
-       | 'declare' 'module' String ':' Type         -- a module's returned value
+stat ::= 'export' 'type' Name [Generics] '=' Type
+       | 'export' 'function' Name [Generics] '(' [parlist] ')' [':' ReturnType]
+       | 'export' Name ':' Type
+```
+
+`export function` declares a function by signature alone — no body, no
+`end`. Every parameter and return must be typed.
+
+```lua
+-- socket/core.luah — declares the native module require("socket.core")
+export type Socket = {
+  send: (self: Socket, data: string) -> (integer?, string?),
+  receive: (self: Socket, pattern: string | integer) -> (string?, string?),
+  close: (self: Socket) -> (),
+}
+
+export function connect(host: string, port: integer): (Socket?, string?)
+export function gettime(): number
+export version: string
 ```
 
 ```lua
-declare module "json": {
-  encode: (value: any) -> string,
-  decode: (text: string) -> any,
-}
-declare love: { graphics: { rectangle: (mode: string, x: number, y: number, w: number, h: number) -> () } }
+-- main.luac
+local socket = require("socket.core")
+local conn, err = socket.connect("example.com", 80)
+if conn then
+  conn:send("GET / HTTP/1.0\r\n\r\n")
+end
 ```
 
-Declaration files are never compiled and produce no output.
+A module whose value is not a table declares it with `return`:
+
+```
+stat ::= 'return' Type
+```
+
+```lua
+-- inspect.luah — the module is a function
+return (value: any) -> string
+```
+
+A header has `export` declarations or a `return`, not both.
+
+### 8.2 Global headers
+
+A header may also declare globals, for values a host application or the
+runtime provides:
+
+```
+stat ::= 'declare' Name ':' Type
+       | 'declare' 'function' Name [Generics] '(' [parlist] ')' [':' ReturnType]
+```
+
+```lua
+-- love.luah
+declare love: {
+  graphics: {
+    rectangle: (mode: "fill" | "line", x: number, y: number, w: number, h: number) -> (),
+  },
+}
+declare function print(...: any)
+```
+
+A global header applies to every chunk in the project. A header with only
+`declare` statements declares no module.
+
+### 8.3 Trust
+
+A header is trusted: nothing checks a native module against its header.
+A header for a `.luac` module is not needed and not allowed — the source is
+its own declaration.
 
 ## 9. Diagnostics
 
@@ -422,7 +495,7 @@ warnings and never stop compilation.
 
 ### 10.1 Erasure
 
-Compiling a `.tlua` file replaces every type-only construct with spaces:
+Compiling a `.luac` file replaces every type-only construct with spaces:
 
 - `: Type` after a binding, parameter or `)`;
 - `<...>` generic parameter lists;
@@ -462,7 +535,7 @@ line of the bundle the source file and line it came from:
 {
   "version": 1,
   "bundle": "app.lua",
-  "files": ["src/main.tlua", "src/util.tlua"],
+  "files": ["src/main.luac", "src/util.luac"],
   "lines": [null, [0, 1], [0, 2], [1, 1]]
 }
 ```
@@ -473,7 +546,7 @@ line of the bundle the source file and line it came from:
 
 Columns within a mapped line are the source's columns, except where a
 rewrite (§10.2) or minification changed the line. A tool can rewrite a
-runtime traceback against the map to point at the `.tlua` sources.
+runtime traceback against the map to point at the `.luac` sources.
 
 ## 11. Open questions
 
@@ -481,7 +554,6 @@ runtime traceback against the map to point at the `.tlua` sources.
    constructor and require a type annotation for tables built up by
    assignment. Open-until-escape keeps the module idiom
    (`local M = {} ... return M`) annotation-free at the cost of one rule.
-2. **Declaration output.** Whether compiling a `.tlua` module also emits a
-   `.d.tlua` for its exports, so typed consumers of the compiled Lua keep
-   its types.
-3. **Extension name** — `.tlua` is a placeholder.
+2. **Header output.** Whether compiling a `.luac` module also emits a
+   `.luah` header next to its `.lua` output, so a project consuming the
+   compiled Lua keeps its types.
