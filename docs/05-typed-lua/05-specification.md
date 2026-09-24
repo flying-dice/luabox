@@ -629,8 +629,8 @@ As in Lua, except for globals (§7.3).
 
 A `typedef` is visible throughout the block that contains it, including
 before it and inside its own definition, so types may be recursive and
-mutually recursive. Two `typedef`s of one name in one block are an error; an inner
-block may shadow an outer name.
+mutually recursive. Two `typedef`s of one name in one block are an error;
+an inner block may shadow an outer name.
 
 Types from an included header are visible from the `#include` line to the
 end of the file.
