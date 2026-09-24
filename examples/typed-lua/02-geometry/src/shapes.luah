@@ -1,0 +1,11 @@
+-- shapes: plain data and a tagged union. No methods and no metatables: the
+-- `kind` field tells the shapes apart.
+#include "vec.luah"
+
+typedef { "circle" kind, Vec centre, number r } Circle
+typedef { "rect" kind, Vec origin, number w, number h } Rect
+typedef Circle | Rect Shape
+
+number area(Shape s)
+number total_area(Shape[] shapes)
+T? largest<T>(T[] items, number(T item) measure)

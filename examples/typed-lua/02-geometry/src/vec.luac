@@ -1,0 +1,25 @@
+#include <math.luah>
+#include "vec.luah"
+
+-- `new` is used by `scale` before it is defined: a forward declaration.
+local Vec(number x, number y) new
+
+local function number len(Vec self)
+  return math.sqrt(self.x * self.x + self.y * self.y)
+end
+
+local function Vec scale(Vec self, number k)
+  return new(self.x * k, self.y * k)
+end
+
+local Meta = { __index = { len = len, scale = scale } }
+
+function Vec new(number x, number y)
+  return setmetatable({ x = x, y = y }, Meta)
+end
+
+local function Vec add(Vec a, Vec b)
+  return new(a.x + b.x, a.y + b.y)
+end
+
+return { new = new, add = add }

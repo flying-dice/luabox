@@ -1,0 +1,12 @@
+-- vec: a 2D vector built with a metatable. Instances get their methods
+-- through __index. This header is the module's whole public interface.
+
+typedef {
+  number x,
+  number y,
+  number(Vec self) len,
+  Vec(Vec self, number k) scale,
+} Vec
+
+Vec new(number x, number y)
+Vec add(Vec a, Vec b)

@@ -1,0 +1,7 @@
+-- The interface of csv.lua. A header for plain Lua is trusted: nothing checks
+-- csv.lua against it, so it must describe what the module really does.
+
+typedef string[] Row
+
+Row split(string line, string sep)
+Row[] parse(string text)

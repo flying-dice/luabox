@@ -1,0 +1,16 @@
+-- socket/core.luah: the interface of a native module, a shared library
+-- (socket/core.dll or socket/core.so) that `require("socket.core")` loads.
+-- Native modules have no Lua source, so the header is trusted as written.
+--
+-- A connected socket is userdata; the header describes it by the methods its
+-- metatable provides.
+
+typedef {
+  (integer?, string?)(Socket self, string data) send,
+  (string?, string?)(Socket self, string | integer pattern) receive,
+  void(Socket self, number? seconds) settimeout,
+  void(Socket self) close,
+} Socket
+
+(Socket?, string?) connect(string host, integer port)
+number gettime()

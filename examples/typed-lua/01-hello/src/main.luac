@@ -1,0 +1,11 @@
+-- The smallest Typed Lua program: typed locals, a typed function, a loop.
+#include <string.luah>
+
+local function string greet(string name, integer times)
+  return string.rep("hello " .. name .. "! ", times)
+end
+
+local string[] names = { "ada", "grace", "linus" }
+for integer i, string name in ipairs(names) do
+  print(i, greet(name, 2))
+end

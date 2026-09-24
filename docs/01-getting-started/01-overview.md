@@ -11,6 +11,8 @@ quickstart and install one-liners. From there:
 
 - [The specification](../03-reference/01-spec.md) - the full design, section by
   section. Code comments cite it as `SPEC.md SN`.
+- [Typed Lua](../05-typed-lua/01-overview.md) - the proposed typed dialect
+  (`.luac` source, `.luah` headers, erased to plain Lua), under review.
 - [Known limitations](../03-reference/02-limitations.md) - every gap a user is
   likely to hit, verified against the shipping binary.
 - [Releasing](../02-guides/01-releasing.md) - how a tag becomes a verified,
