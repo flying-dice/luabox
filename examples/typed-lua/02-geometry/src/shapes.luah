@@ -1,0 +1,10 @@
+-- shapes: plain data. Every kind of shape is one record with a `kind` tag,
+-- as C code does it; each kind sets the fields it uses and leaves the rest
+-- nil.
+#include "vec.luah"
+
+typedef Shape = { kind: string, at: Vec, r: number, w: number, h: number }
+
+area(s: Shape): number
+total_area(shapes: Shape[]): number
+largest(shapes: Shape[]): Shape

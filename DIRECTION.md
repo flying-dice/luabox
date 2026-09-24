@@ -1,5 +1,11 @@
 # Type-system direction (decision record)
 
+> **Proposed replacement (2026-09-24).** [Decision 17](decisions/17-typed-lua-dialect.md)
+> proposes Typed Lua — typed `.luac` source with C-style `.luah` headers,
+> erased to plain Lua — in place of the LuaCATS direction below. The design
+> is in [docs/05-typed-lua/](docs/05-typed-lua/01-overview.md). Until it is
+> accepted, this record stands.
+
 Status: **accepted** (2026-07-11). Supersedes the earlier `.luab` shape DSL
 direction (SHAPES-V2, removed under #109).
 

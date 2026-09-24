@@ -1,0 +1,31 @@
+#include <math.luah>
+#include "shapes.luah"
+
+local function area(s: Shape): number
+  if s.kind == "circle" then
+    return math.pi * s.r ^ 2
+  end
+  return s.w * s.h
+end
+
+local function total_area(shapes: Shape[]): number
+  local total: number = 0
+  for _, s: Shape in ipairs(shapes) do
+    total = total + area(s)
+  end
+  return total
+end
+
+local function largest(shapes: Shape[]): Shape
+  local best: Shape = nil
+  local best_area: number = -math.huge
+  for _, s: Shape in ipairs(shapes) do
+    local a = area(s)
+    if a > best_area then
+      best, best_area = s, a
+    end
+  end
+  return best
+end
+
+return { area = area, total_area = total_area, largest = largest }

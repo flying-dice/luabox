@@ -388,6 +388,11 @@ extensions release from their own repos;
 not yet published to a package registry (crates.io, Homebrew, etc.). Luau is
 explicitly out of scope. See [LIMITATIONS.md](docs/03-reference/02-limitations.md) for known gaps.
 
+**Proposed direction:** [Typed Lua](docs/05-typed-lua/01-overview.md) — a
+typed dialect (`.luac` source, C-style `.luah` headers) that compiles to
+plain Lua by erasing its types. Under review in
+[decision 17](decisions/17-typed-lua-dialect.md); nothing ships yet.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

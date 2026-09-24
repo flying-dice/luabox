@@ -1,0 +1,5 @@
+apple   0.50
+pear    0.75
+skipped line 3
+plum    1.25
+total   2.50

@@ -7,6 +7,10 @@ dialect (luabox itself never executes Lua).
 
 Work through them top to bottom; each introduces one new idea.
 
+The proposed Typed Lua dialect has its own examples in
+[typed-lua/](typed-lua/), with hand-written compiler output checked against
+its spec.
+
 | # | Example | Edition → target | Demonstrates |
 |---|---------|------------------|--------------|
 | 1 | [hello-luabox](hello-luabox/) | 5.4 | The 60-second tour: `init` → `check` → `fmt` → `lint`, one annotated function |
